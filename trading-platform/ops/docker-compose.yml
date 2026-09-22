@@ -1,0 +1,109 @@
+# Single-node stack. Start here — Kubernetes on one node is a way to spend your evenings
+# on YAML instead of research. Migrate when you actually have more than one node.
+name: ux-trader
+
+x-common: &common
+  restart: unless-stopped
+  env_file: [../.env]
+  networks: [ux]
+
+services:
+  clickhouse:
+    <<: *common
+    image: clickhouse/clickhouse-server:24.8
+    volumes: [ch-data:/var/lib/clickhouse]
+    ports: ["8123:8123", "9000:9000"]
+    ulimits: { nofile: { soft: 262144, hard: 262144 } }
+
+  postgres:
+    <<: *common
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: ux, POSTGRES_PASSWORD: ux, POSTGRES_DB: ux }
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ux"]
+      interval: 10s
+
+  redis:
+    <<: *common
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes: [redis-data:/data]
+
+  nats:
+    <<: *common
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data"]
+    volumes: [nats-data:/data]
+
+  md-ingest-binance:
+    <<: *common
+    build: { context: .., dockerfile: ops/Dockerfile }
+    command: python -m uxtrader.data.ingest --venue binanceusdm
+    depends_on: [clickhouse, nats]
+    healthcheck:                       # restarts a wedged feed — highest-value automation here
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  portfolio:
+    <<: *common
+    build: { context: .., dockerfile: ops/Dockerfile }
+    command: python -m uxtrader.portfolio_service
+    depends_on: [postgres, nats]
+
+  risk:
+    <<: *common
+    build: { context: .., dockerfile: ops/Dockerfile }
+    command: python -m uxtrader.risk_service
+    depends_on: [nats, portfolio]
+
+  execution:
+    <<: *common
+    build: { context: .., dockerfile: ops/Dockerfile }
+    command: python -m uxtrader.execution_service
+    depends_on: [nats, risk, redis]
+    deploy: { replicas: 1 }            # SINGLETON. Never scale this. Redis lock backs it up.
+
+  strategy-engine:
+    <<: *common
+    build: { context: .., dockerfile: ops/Dockerfile }
+    command: python -m uxtrader.engine --config /config/strategies.yaml
+    depends_on: [nats, risk]
+    volumes: ["../config:/config:ro"]
+
+  watchdog:
+    # Kill-switch L2. Separate image, separate credentials, separate failure domain.
+    # On a single node this is the weakest version of the idea — run it off-box in prod.
+    restart: always
+    image: python:3.12-slim
+    env_file: [../.env.watchdog]
+    command: >
+      sh -c "pip install --no-cache-dir ccxt && python -m uxtrader.ops.watchdog"
+    volumes: ["../src:/app/src:ro"]
+    working_dir: /app
+    environment: { PYTHONPATH: /app/src }
+    networks: [ux]
+
+  api:
+    <<: *common
+    build: { context: .., dockerfile: ops/Dockerfile }
+    command: uvicorn uxtrader.api.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    depends_on: [postgres, nats]
+
+  prometheus:
+    <<: *common
+    image: prom/prometheus:v2.54.1
+    volumes: ["./grafana/prometheus.yml:/etc/prometheus/prometheus.yml:ro", prom-data:/prometheus]
+    ports: ["9090:9090"]
+
+  grafana:
+    <<: *common
+    image: grafana/grafana:11.2.0
+    volumes: [grafana-data:/var/lib/grafana, "./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro"]
+    ports: ["3000:3000"]
+
+volumes: { ch-data: {}, pg-data: {}, redis-data: {}, nats-data: {}, prom-data: {}, grafana-data: {} }
+networks: { ux: {} }

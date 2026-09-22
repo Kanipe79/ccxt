@@ -1,0 +1,38 @@
+# Kill-switch L2. Its entire purpose is to survive whatever kills the trading stack, so
+# it deliberately shares nothing with it: different namespace, different node pool,
+# different image, different credentials. If you "simplify" any of that away, this
+# becomes decoration.
+apiVersion: v1
+kind: Namespace
+metadata: { name: ux-safety }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: watchdog
+  namespace: ux-safety
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: watchdog } }
+  template:
+    metadata:
+      labels: { app: watchdog }
+    spec:
+      priorityClassName: system-cluster-critical
+      nodeSelector: { pool: safety }        # a DIFFERENT node pool from the trading stack
+      containers:
+        - name: watchdog
+          image: ghcr.io/you/ux-watchdog@sha256:REPLACE_WITH_DIGEST
+          command: ["python", "-m", "uxtrader.ops.watchdog"]
+          env:
+            - name: WATCHDOG_HEARTBEAT_TIMEOUT
+              value: "90"
+            - name: WATCHDOG_EQUITY_DROP_PCT
+              value: "0.05"
+            - name: WATCHDOG_DRY_RUN
+              value: "false"     # set true until you have TESTED it firing
+          envFrom:
+            - secretRef: { name: ux-watchdog-credentials }  # read + cancel + reduce-only ONLY
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }

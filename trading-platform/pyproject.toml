@@ -1,0 +1,57 @@
+[project]
+name = "ux-trader"
+version = "0.1.0"
+description = "Systematic crypto trading platform on the uxcore CCXT fork"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.4",
+    "pydantic>=2.8",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "pandas>=2.2",
+    "polars>=1.5",
+    "optuna>=3.6",
+    "aiohttp>=3.10",
+    "uvloop>=0.20; sys_platform != 'win32'",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "structlog>=24.4",
+    "prometheus-client>=0.20",
+    "clickhouse-driver>=0.2.9",
+    "asyncpg>=0.29",
+    "redis>=5.0",
+    "nats-py>=2.9",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11", "hypothesis>=6.112"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF", "ASYNC", "S", "BLE", "SLF"]
+ignore = ["E501", "S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/uxtrader"]
+# uxcore wraps a dynamically-typed upstream; strict typing there fights the fork.
+[[tool.mypy.overrides]]
+module = ["uxcore.*", "ccxt.*"]
+ignore_missing_imports = true
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

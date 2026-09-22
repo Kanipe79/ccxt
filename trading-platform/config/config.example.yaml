@@ -1,0 +1,66 @@
+# ux-trader configuration. Secrets live in Vault/SOPS, never here.
+mode: paper                # dev | paper | prod-small | prod
+
+account:
+  starting_equity: 100000
+  base_currency: USDT
+
+venues:
+  binanceusdm:
+    enabled: true
+    # credentials injected at runtime from Vault; withdrawal permission MUST be off
+    rate_limit:
+      budget: 2400
+      window_s: 60
+    max_nav_fraction: 0.25
+  bybit:
+    enabled: true
+    max_nav_fraction: 0.25
+  okx:
+    enabled: false
+    max_nav_fraction: 0.20
+
+risk:
+  # Mirrors docs/01 §0.3. These are enforced by the risk engine, not by strategies.
+  max_risk_per_trade: 0.010
+  max_daily_loss: 0.030
+  max_weekly_loss: 0.060
+  dd_halve_at: 0.12
+  dd_stop_at: 0.18
+  max_gross_leverage: 3.0
+  max_net_leverage: 1.0
+  max_venue_fraction: 0.25
+  max_asset_fraction: 0.20
+  max_cluster_fraction: 0.35
+  max_consecutive_losses: 8
+  max_orders_per_min: 60
+  max_feed_staleness_s: 5.0
+  max_var_99_1d: 0.04
+
+watchdog:                  # kill-switch layer 2 — runs as a SEPARATE deployment
+  heartbeat_timeout_s: 90
+  equity_drop_pct: 0.05
+  equity_window_s: 300
+  dry_run: true            # set false only after you have tested it firing
+
+costs:                     # used by backtest AND paper; keep them pessimistic
+  taker_fee_bps: 5.5
+  maker_fee_bps: 2.0
+  impact_k: 0.4
+  latency_mean_ms: 250
+  latency_std_ms: 80
+  reject_rate: 0.001
+
+storage:
+  clickhouse: { host: clickhouse, port: 9000, database: ux }
+  postgres:   { dsn: "postgresql://ux:ux@postgres:5432/ux" }
+  redis:      { url: "redis://redis:6379/0" }
+  nats:       { url: "nats://nats:4222" }
+  parquet:    { root: "s3://ux-research/" }
+
+observability:
+  prometheus_port: 9100
+  log_level: INFO
+  alerts:
+    telegram: { enabled: true, chat_id: "${TELEGRAM_CHAT_ID}" }
+    discord:  { enabled: false }

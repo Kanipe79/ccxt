@@ -1,0 +1,51 @@
+# The execution engine is a SINGLETON. Two of these racing on one account is the worst
+# bug class in this domain, so it is made impossible rather than unlikely:
+#   * replicas: 1
+#   * strategy: Recreate  (a RollingUpdate would briefly run two)
+#   * a Redis lease on top, because belt and braces
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: execution-engine
+  namespace: ux-trading
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: execution-engine }
+  template:
+    metadata:
+      labels: { app: execution-engine }
+      annotations: { prometheus.io/scrape: "true", prometheus.io/port: "9100" }
+    spec:
+      priorityClassName: system-cluster-critical
+      serviceAccountName: ux-execution
+      containers:
+        - name: execution
+          image: ghcr.io/you/ux-trader@sha256:REPLACE_WITH_DIGEST   # never :latest
+          command: ["python", "-m", "uxtrader.execution_service"]
+          env:
+            - name: UX_MODE
+              value: "prod"
+            - name: UX_LOCK_BACKEND
+              value: "redis://redis:6379/1"
+          envFrom:
+            - secretRef: { name: ux-venue-credentials }   # withdrawal permission OFF
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }      # p50
+            limits:   { cpu: "2000m", memory: "3Gi" }     # 3x p50 — do not throttle at the worst moment
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }         # false until reconciliation passes
+            periodSeconds: 5
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: execution-engine, namespace: ux-trading }
+spec:
+  minAvailable: 0          # a singleton cannot be highly available; be honest about it
+  selector: { matchLabels: { app: execution-engine } }

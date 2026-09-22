@@ -1,0 +1,60 @@
+# Risk budgets sum to 1.00 and are allocations of RISK, not capital.
+# Rationale for each number: docs/01-strategies.md §8.
+strategies:
+  - id: S1
+    class: uxtrader.strategies.FundingCarry
+    enabled: true
+    risk_budget: 0.35
+    stage: 1                # staged rollout: 1=10% size, 2=25%, 3=50%, 4=100%
+    symbols: [BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT]
+    params: { min_apr: 0.12, exit_apr: 0.03, min_liq_distance: 0.35 }
+
+  - id: S2
+    class: uxtrader.strategies.CrossSectionalMomentum
+    enabled: false          # enable at >$25k equity — needs ~16 positions
+    risk_budget: 0.20
+    stage: 1
+    params: { lookback_short: 30, lookback_long: 90, skip_days: 3, no_trade_band: 0.25 }
+
+  - id: S4
+    class: uxtrader.strategies.DonchianRegime
+    enabled: true
+    risk_budget: 0.20
+    stage: 1
+    symbols: [BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT]
+    params: { channel: 55, exit_channel: 20, stop_atr_mult: 2.5, risk_fraction: 0.015 }
+
+  - id: S3
+    class: uxtrader.strategies.PairsStatArb
+    enabled: false          # enable at >$100k — two legs per position
+    risk_budget: 0.15
+    stage: 1
+    pairs:
+      - { a: ETH/USDT:USDT, b: BTC/USDT:USDT }
+      - { a: SOL/USDT:USDT, b: AVAX/USDT:USDT }
+
+  - id: S5
+    class: uxtrader.strategies.VwapMeanReversion
+    enabled: false          # last to enable — needs a good maker stack
+    risk_budget: 0.05
+    stage: 1
+    symbols: [BTC/USDT:USDT, ETH/USDT:USDT]
+
+  - id: S6
+    class: uxtrader.strategies.AdaptiveGrid
+    enabled: false          # only after kill switches proven in anger
+    risk_budget: 0.03
+    stage: 1
+    symbols: [BTC/USDT:USDT]
+
+  - id: S7
+    class: uxtrader.strategies.SqueezeFade
+    enabled: false
+    risk_budget: 0.02
+    stage: 1
+    symbols: [BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT]
+
+correlation_clusters:       # used by the risk engine's cluster exposure cap
+  majors: [BTC/USDT:USDT, ETH/USDT:USDT]
+  l1:     [SOL/USDT:USDT, AVAX/USDT:USDT, NEAR/USDT:USDT, APT/USDT:USDT]
+  l2:     [ARB/USDT:USDT, OP/USDT:USDT]
