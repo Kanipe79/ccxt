@@ -238,6 +238,14 @@ class Fill(Frozen):
     fee_currency: str
     ts: datetime
     is_maker: bool
+    arrival_price: Decimal | None = None   # stamped by the OMS; slippage is measured off it
+
+    @property
+    def slippage_bps(self) -> float | None:
+        if not self.arrival_price:
+            return None
+        sign = 1 if self.side == 'buy' else -1
+        return float((self.price - self.arrival_price) / self.arrival_price) * 1e4 * sign
 
 
 class Position(BaseModel):

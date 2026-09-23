@@ -150,8 +150,18 @@ class UXExchangeMixin:
 
     def round_to_market(self, symbol: str, amount: Decimal,
                         price: Decimal | None = None) -> tuple[Decimal, Decimal | None]:
-        """Apply the venue's precision and minimums. Doing this late causes rejects."""
-        amt = Decimal(str(self.amount_to_precision(symbol, float(amount))))  # type: ignore[attr-defined]
+        """Apply the venue's precision and minimums. Doing this late causes rejects.
+
+        Returns an amount of 0 when the order is below the venue's minimum — callers
+        treat that as a local reject. (ccxt's ``amount_to_precision`` raises
+        ``InvalidOrder`` rather than returning 0 when truncation reaches zero.)
+        """
+        try:
+            amt = Decimal(str(self.amount_to_precision(symbol, float(amount))))  # type: ignore[attr-defined]
+        except Exception as exc:                              # noqa: BLE001
+            if type(exc).__name__ != 'InvalidOrder':
+                raise
+            return Decimal('0'), price
         px = (Decimal(str(self.price_to_precision(symbol, float(price))))    # type: ignore[attr-defined]
               if price is not None else None)
         market = self.market(symbol)                                          # type: ignore[attr-defined]

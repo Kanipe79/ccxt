@@ -93,7 +93,7 @@ def summarize(returns, equity=None,
     years = r.size / periods_per_year
     cagr = float((1 + total) ** (1 / years) - 1) if years > 0 and total > -1 else 0.0
     sr = sharpe(r, periods_per_year)
-    wins, losses = r[r > 0], r[r < 0]
+    wins = r[r > 0]
     return Summary(
         n_obs=int(r.size), total_return=total, cagr=cagr, sharpe=sr,
         sortino=sortino(r, periods_per_year),

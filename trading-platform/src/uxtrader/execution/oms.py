@@ -129,6 +129,8 @@ class OrderManager:
 
     async def on_fill(self, fill: Fill) -> None:
         order = self._orders.get(fill.client_order_id)
+        if order is not None and fill.arrival_price is None and order.arrival_price:
+            fill = fill.model_copy(update={'arrival_price': order.arrival_price})
         if order is None:
             log.warning('fill_for_unknown_order coid=%s', fill.client_order_id)
         else:

@@ -39,6 +39,12 @@ groups:
         labels: { severity: warning }
         annotations: { summary: "Execution worse than model — check before blaming alpha decay" }
 
+      - alert: MeanSlippageAboveModel
+        # Histogram _sum is not exported (negative buckets), hence the signed-sum gauge.
+        expr: sum(ux_slippage_bps_signed_sum) / sum(ux_slippage_bps_count) > 1.5 * ux_slippage_model_bps
+        for: 6h
+        labels: { severity: warning }
+
       - alert: RateLimitPressure
         expr: ux_ratelimit_utilisation > 0.70
         for: 5m

@@ -50,7 +50,9 @@ class RiskState:
     peak_equity: Decimal
     day_start_equity: Decimal
     week_start_equity: Decimal
-    positions: dict[str, Position] = field(default_factory=dict)
+    # Every open (venue, symbol, strategy) book. A dict keyed by symbol is accepted
+    # for convenience (single-strategy tests and the vector engine) and normalised.
+    positions: list[Position] | dict[str, Position] = field(default_factory=list)
     marks: dict[str, Decimal] = field(default_factory=dict)
     clusters: dict[str, str] = field(default_factory=dict)    # symbol → cluster id
     stale_feeds: set[str] = field(default_factory=set)
@@ -58,6 +60,18 @@ class RiskState:
     orders_this_min: dict[str, int] = field(default_factory=dict)
     var_99_1d: float = 0.0
     now: datetime | None = None         # required for the daily halt to expire
+
+    def __post_init__(self) -> None:
+        if isinstance(self.positions, dict):
+            self.positions = list(self.positions.values())
+
+    def strategy_qty(self, strategy: str, symbol: str) -> Decimal:
+        return sum((p.quantity for p in self.positions            # type: ignore[union-attr]
+                    if p.symbol == symbol and p.strategy == strategy), Decimal('0'))
+
+    def net_qty(self, symbol: str) -> Decimal:
+        return sum((p.quantity for p in self.positions            # type: ignore[union-attr]
+                    if p.symbol == symbol), Decimal('0'))
 
     @property
     def drawdown(self) -> float:
@@ -197,8 +211,9 @@ class RiskEngine:
     def evaluate(self, intent: Intent, state: RiskState) -> RiskDecision:
         breaches: list[LimitBreach] = []
         L = self.limits
-        current = state.positions.get(intent.symbol)
-        have = current.quantity if current else Decimal('0')
+        # Intents are strategy-level: compare against THIS strategy's book, and apply
+        # the caps to the portfolio's resulting NET exposure.
+        have = state.strategy_qty(intent.strategy, intent.symbol)
         target = intent.target.position
 
         # 0. De-risking is ALWAYS permitted — through a fired kill switch, a drawdown
@@ -247,19 +262,26 @@ class RiskEngine:
             return self._veto(intent, 'no_mark', 0.0, 0.0, note='no mark price')
 
         allowed_qty = self._max_position(intent, state, mark)
-        scale = Decimal('1')
-        if abs(target) > allowed_qty:
+        net_now = state.net_qty(intent.symbol)
+        others = net_now - have
+        new_net = others + target
+        adjusted = target
+        # Only shrink when this change pushes net exposure past the cap AND grows it.
+        # A strategy trading against the rest of the book reduces net risk; capping it
+        # would perversely keep the portfolio more exposed.
+        if abs(new_net) > allowed_qty and abs(new_net) > abs(net_now):
+            capped_net = allowed_qty if new_net > 0 else -allowed_qty
+            lo, hi = min(have, target), max(have, target)
+            adjusted = min(max(capped_net - others, lo), hi)   # never past the request
             breaches.append(LimitBreach(limit='position_cap',
-                                        observed=float(abs(target) * mark / state.equity),
+                                        observed=float(abs(new_net) * mark / state.equity),
                                         allowed=float(allowed_qty * mark / state.equity),
                                         hard=False))
-            scale = allowed_qty / abs(target)
 
         # 7. portfolio VaR
         if state.var_99_1d > L.max_var_99_1d:
             return self._veto(intent, 'var_99', state.var_99_1d, L.max_var_99_1d)
 
-        adjusted = target * scale
         dd = state.drawdown
         if dd >= L.dd_halve_at:
             adjusted *= Decimal('0.5')
@@ -285,7 +307,7 @@ class RiskEngine:
 
         if intent.venue:
             venue_used = sum(p.notional(state.marks.get(p.symbol, Decimal('0')))
-                             for p in state.positions.values()
+                             for p in state.positions
                              if p.venue == intent.venue and p.symbol != intent.symbol)
             caps.append(max(Decimal('0'),
                             Decimal(str(L.max_venue_fraction)) * eq - venue_used) / mark)
@@ -293,14 +315,14 @@ class RiskEngine:
         cluster = state.clusters.get(intent.symbol)
         if cluster:
             cluster_used = sum(p.notional(state.marks.get(p.symbol, Decimal('0')))
-                               for p in state.positions.values()
+                               for p in state.positions
                                if state.clusters.get(p.symbol) == cluster
                                and p.symbol != intent.symbol)
             caps.append(max(Decimal('0'),
                             Decimal(str(L.max_cluster_fraction)) * eq - cluster_used) / mark)
 
         gross_used = sum(p.notional(state.marks.get(p.symbol, Decimal('0')))
-                         for p in state.positions.values() if p.symbol != intent.symbol)
+                         for p in state.positions if p.symbol != intent.symbol)
         caps.append(max(Decimal('0'),
                         Decimal(str(L.max_gross_leverage)) * eq - gross_used) / mark)
 

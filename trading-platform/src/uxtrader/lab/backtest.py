@@ -88,7 +88,8 @@ class EventDrivenBacktester:
         ctx = StrategyContext(
             strategy=strategy_cls.name, clock=clock,
             equity=self.starting_equity, risk_budget=self.risk_budget,
-            positions=portfolio.positions(), marks=portfolio.marks, params=self.params)
+            positions=portfolio.strategy_positions(strategy_cls.name),
+            marks=portfolio.marks, params=self.params)
         strategy = strategy_cls(ctx)
         await strategy.on_start()
 
@@ -117,7 +118,7 @@ class EventDrivenBacktester:
                         await self._route(intent, oms, portfolio, clock, result)
                     # The strategy must see these fills before it sees this bar. Without
                     # this refresh it would act on a position one bar stale.
-                    ctx._positions = portfolio.positions()      # noqa: SLF001
+                    ctx._positions = portfolio.strategy_positions(strategy.name)  # noqa: SLF001
                     ctx.equity = portfolio.equity
 
             clock.advance_to(max(clock.now(), self._event_ts(event)))
@@ -134,7 +135,7 @@ class EventDrivenBacktester:
                 self._roll_periods(event.close_ts, prev_equity)
                 portfolio.mark_to_market(event.symbol, event.close)
                 # The strategy's read-only view must track the portfolio.
-                ctx._positions = portfolio.positions()      # noqa: SLF001
+                ctx._positions = portfolio.strategy_positions(strategy.name)  # noqa: SLF001
                 ctx.equity = portfolio.equity
                 result.equity_curve.append((clock.now(), float(portfolio.equity)))
 
@@ -144,7 +145,7 @@ class EventDrivenBacktester:
                 reason = self.risk.take_flatten_request()
                 if reason:
                     result.risk_flattens.append((clock.now(), reason))
-                    for pos in portfolio.positions().values():
+                    for pos in portfolio.all_positions():
                         flat = Intent(strategy=pos.strategy or 'risk', venue=pos.venue,
                                       symbol=pos.symbol,
                                       target=TargetSpec(position=Decimal('0')),
@@ -169,11 +170,11 @@ class EventDrivenBacktester:
         if isinstance(event, TradeTick):
             return await strategy.on_trade(event)
         if isinstance(event, Funding):
-            pos = portfolio.position(event.venue, event.symbol)
-            if not pos.is_flat:
-                portfolio.apply_funding(event.venue, event.symbol, pos.strategy,
-                                        event.rate,
-                                        portfolio.marks.get(event.symbol, Decimal('0')))
+            for pos in portfolio.all_positions():
+                if pos.venue == event.venue and pos.symbol == event.symbol:
+                    portfolio.apply_funding(event.venue, event.symbol, pos.strategy,
+                                            event.rate,
+                                            portfolio.marks.get(event.symbol, Decimal('0')))
             return await strategy.on_funding(event)
         return []
 
@@ -192,7 +193,7 @@ class EventDrivenBacktester:
             equity=portfolio.equity, peak_equity=portfolio.peak_equity,
             day_start_equity=self._day_start or portfolio.starting_equity,
             week_start_equity=self._week_start or portfolio.starting_equity,
-            positions=portfolio.positions(), marks=dict(portfolio.marks),
+            positions=portfolio.all_positions(), marks=dict(portfolio.marks),
             now=clock.now())
 
     async def _route(self, intent: Intent, oms: OrderManager, portfolio: Portfolio,
@@ -204,7 +205,7 @@ class EventDrivenBacktester:
             return
         venue = intent.venue or 'sim'
         await oms.execute(intent, decision,
-                          portfolio.position(venue, intent.symbol), venue)
+                          portfolio.position(venue, intent.symbol, intent.strategy), venue)
 
     def _book_for(self, venue: str, symbol: str) -> BookSnapshot | None:
         return self._books.get((venue, symbol))

@@ -9,9 +9,12 @@ Subject layout (NATS-style tokens, ``*`` = one token, ``>`` = the rest)::
     md.{venue}.{kind}.{symbol}     market data   kind ∈ bar|trade|book|funding
     intent.{strategy}              strategy → risk
     exec.order                     risk → execution (approved, possibly shrunk)
+    exec.report                    execution → metrics, dashboard (order state)
     risk.veto                      risk → alerts/dashboard
     fill.{venue}                   execution → portfolio, strategies
-    feed.stale                     ingest → risk, strategies
+    feed.stale / feed.recovered    ingest → risk, execution, strategies
+    portfolio.snapshot             portfolio → risk, execution, strategy engine
+    control.{command}              operator → services (kill, rearm, flatten)
     heartbeat.{service}            every service → watchdog
 """
 from __future__ import annotations
@@ -21,8 +24,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from decimal import Decimal
+
 from .types import (
-    Bar, BookSnapshot, Fill, Funding, Intent, Order, RiskDecision, TradeTick, utcnow,
+    Bar, BookSnapshot, Fill, Funding, Intent, Order, Position, RiskDecision, TradeTick,
+    utcnow,
 )
 
 
@@ -40,8 +46,13 @@ def intent_subject(strategy: str) -> str:
 
 
 EXEC_ORDER = 'exec.order'
+EXEC_REPORT = 'exec.report'
 RISK_VETO = 'risk.veto'
 FEED_STALE = 'feed.stale'
+FEED_RECOVERED = 'feed.recovered'
+PORTFOLIO_SNAPSHOT = 'portfolio.snapshot'
+CONTROL_KILL = 'control.kill'
+CONTROL_REARM = 'control.rearm'
 
 
 def fill_subject(venue: str) -> str:
@@ -58,6 +69,43 @@ class StaleFeed(BaseModel):
     venue: str
     symbol: str
     age_s: float
+    ts: datetime = Field(default_factory=utcnow)
+
+
+class FeedRecovered(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    key: str
+    venue: str
+    symbol: str
+    ts: datetime = Field(default_factory=utcnow)
+
+
+class PortfolioSnapshot(BaseModel):
+    """Portfolio truth, broadcast after every change. Risk, execution and the
+    strategy engine read positions ONLY from here — never from a venue directly —
+    so no two components can disagree about the book."""
+    model_config = ConfigDict(frozen=True)
+    seq: int
+    equity: Decimal
+    peak_equity: Decimal
+    day_start_equity: Decimal
+    week_start_equity: Decimal
+    positions: tuple[Position, ...]
+    marks: dict[str, Decimal]
+    ts: datetime = Field(default_factory=utcnow)
+
+    def position_map(self) -> dict[str, Position]:
+        return {p.symbol: p for p in self.positions}
+
+
+class Control(BaseModel):
+    """Operator command. Every path that can stop trading — dashboard button,
+    Telegram, CLI — publishes one of these."""
+    model_config = ConfigDict(frozen=True)
+    command: str                        # 'kill' | 'rearm' | 'flatten'
+    reason: str
+    strategy: str | None = None
+    venue: str | None = None
     ts: datetime = Field(default_factory=utcnow)
 
 
@@ -78,7 +126,8 @@ class ApprovedIntent(BaseModel):
 REGISTRY: dict[str, type[BaseModel]] = {
     cls.__name__: cls
     for cls in (Bar, TradeTick, BookSnapshot, Funding, Intent, RiskDecision, Order,
-                Fill, StaleFeed, Heartbeat, ApprovedIntent)
+                Fill, StaleFeed, FeedRecovered, PortfolioSnapshot, Control, Heartbeat,
+                ApprovedIntent)
 }
 
 

@@ -1,9 +1,18 @@
 # Roadmap — v0.1 to Production
 
+> **Where the code is now:** Phases 0, 2 and 4 are built and their gates pass offline;
+> Phase 1 is built except persistence; Phase 5's tooling (services, alerts, metrics,
+> dashboard) is built, but the 30 days of paper trading it requires have not started.
+> No strategy has passed Phase 3's real-data validation. The one blocker that cannot be
+> solved in code is running `uxtrader.data.history` somewhere that can reach the venues.
+> Per-component detail: `docs/02-architecture.md §9`.
+
 Eighteen weeks at a realistic part-time-to-full-time pace for one competent engineer.
 Each phase ends with a gate that is a *demonstration*, not a checkbox.
 
 ## Phase 0 — Foundations (weeks 1 – 2)
+**Status: gate passed** — `tests/uxcore/test_phase0_gate.py`, against the fork's real ccxt.
+
 - Fork CCXT, set up `upstream/master` tracking, monthly merge job.
 - `uxcore`: error taxonomy, `@resilient` decorator, weight-aware rate limiter.
 - Repo skeleton, `pyproject.toml`, ruff + mypy strict, CI.
@@ -13,6 +22,8 @@ Each phase ends with a gate that is a *demonstration*, not a checkbox.
 429 and a forced timeout, and show correct classification and reconciliation for both.
 
 ## Phase 1 — Data (weeks 3 – 4)
+**Status: built except ClickHouse.** Loader, immutable Parquet store, point-in-time reads, WS ingest, resampler. The 4-year backfill has not been run (no venue access from the build environment).
+
 - `md-ingest` for one venue: WS trades, book, funding + REST backfill.
 - ClickHouse schema, gap detection and repair.
 - Historical loader: 4 years of OHLCV and funding for 40 symbols → Parquet.
@@ -22,6 +33,8 @@ Each phase ends with a gate that is a *demonstration*, not a checkbox.
 to within one tick. Prove the universe table returns the *2022* top-40 when asked for 2022.
 
 ## Phase 2 — Backtester (weeks 5 – 7)
+**Status: gate passed** for S4 on synthetic data: the two engines agree exactly, and the look-ahead guard caught a real ordering bug.
+
 - `SimClock` with the look-ahead runtime guard.
 - Event-driven engine + realistic fill model (queue position, latency, partials).
 - Vectorized engine for search.
@@ -33,6 +46,8 @@ the full report from `docs/03 §5`. Deliberately introduce a look-ahead bug and 
 guard catches it.
 
 ## Phase 3 — Strategy framework and first validation (weeks 6 – 9, overlaps)
+**Status: framework done; validation not started.** Needs real data.
+
 - `StrategyBase`, `Intent`, `StrategyContext`, the engine host.
 - Implement S1 (carry) and S4 (trend) properly.
 - Run the **full G1 – G5 pipeline** on both, including walk-forward and Monte Carlo.
@@ -41,6 +56,8 @@ guard catches it.
 gate, it does not proceed — and you will have learned more from that than from a pass.**
 
 ## Phase 4 — Risk and execution (weeks 10 – 12)
+**Status: built.** Kill → flatten → rearm, daily-loss halt, stale-feed blocking and per-strategy books are tested end to end. **Still open:** L3 venue-native stops; algos not wired into the OMS.
+
 - `risk.py`: the full check ladder, drawdown ladder, kill switch L1.
 - `portfolio.py`: position truth, PnL attribution, reconciliation loop.
 - `execution/`: OMS state machine, deterministic client IDs, startup reconciliation.
@@ -53,6 +70,8 @@ correct position with no duplicate. Kill the *whole stack* and show the L2 watch
 flattens within 90 seconds.
 
 ## Phase 5 — Paper trading (weeks 13 – 15)
+**Status: tooling built; the 30-day run itself has not started.**
+
 - Full stack in `paper`, running S1 + S4 continuously.
 - Prometheus/Grafana boards 1 – 3, Telegram alerting, the daily report.
 - Nightly backtest-vs-paper diff job.

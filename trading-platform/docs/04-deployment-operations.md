@@ -37,6 +37,28 @@ sops --decrypt config/secrets.enc.yaml > /run/secrets/config.yaml
 
 ## 3. Local / single-node deployment
 
+### 3.0 Three ways to run it
+
+```bash
+# (a) See it working — synthetic market, no keys, no network:
+python -m uxtrader.demo --port 8765 --token demo          # http://127.0.0.1:8765
+
+# (b) Paper trading, one process, in-memory bus, real market data:
+cp config/config.example.yaml config/config.yaml           # mode: paper
+cp config/strategies.example.yaml config/strategies.yaml
+python -m uxtrader.run --role all
+
+# (c) One service per container over NATS — see the compose file below.
+```
+
+Warm-up: the engine role backfills each strategy's `warmup_bars` over REST before it
+subscribes to live data. S4 needs about 1,250 4h bars, roughly 208 days.
+
+Operator controls (kill / flatten / rearm) go through `POST /api/control` with
+`Authorization: Bearer $UX_API_TOKEN`. When `UX_API_TOKEN` is unset, control is
+disabled rather than left open. A global kill reaches both the risk service (L1) and
+the out-of-process watchdog (L2).
+
 `ops/docker-compose.yml` brings up the full stack. Start here; you do not need Kubernetes
 for one node, and running K8s on one node is a way to spend your evenings on YAML instead
 of research.

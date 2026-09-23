@@ -20,10 +20,19 @@ class ReconciliationDrift(Exception):
 
 
 class Portfolio:
+    """Positions are held per (venue, symbol, strategy).
+
+    Several strategies trade the same instrument (S1, S4, S5, S6 and S7 all trade the
+    BTC perpetual). If they shared one net position, their target-position intents
+    would overwrite each other: S4 asks for +0.3, S1 asks for −0.5, and each "fixes"
+    the other's position. So every strategy owns a virtual book, fills are attributed
+    by the strategy on the order, and the venue's net position is the sum.
+    """
+
     def __init__(self, starting_equity: Decimal) -> None:
         self.starting_equity = starting_equity
         self.cash = starting_equity
-        self._positions: dict[tuple[str, str], Position] = {}
+        self._positions: dict[tuple[str, str, str], Position] = {}
         self.marks: dict[str, Decimal] = {}
         self.realized_by_strategy: dict[str, Decimal] = defaultdict(Decimal)
         self.fees_by_strategy: dict[str, Decimal] = defaultdict(Decimal)
@@ -32,18 +41,35 @@ class Portfolio:
 
     # -- accessors -------------------------------------------------------------
 
-    def position(self, venue: str, symbol: str, strategy: str = '') -> Position:
-        key = (venue, symbol)
+    def position(self, venue: str, symbol: str, strategy: str) -> Position:
+        key = (venue, symbol, strategy)
         if key not in self._positions:
             self._positions[key] = Position(venue=venue, symbol=symbol, strategy=strategy)
         return self._positions[key]
 
-    def positions(self) -> dict[str, Position]:
-        return {p.symbol: p for p in self._positions.values() if not p.is_flat}
+    def all_positions(self) -> list[Position]:
+        """Every open (venue, symbol, strategy) book. What risk sums exposure over."""
+        return [p for p in self._positions.values() if not p.is_flat]
 
-    def by_strategy(self, strategy: str) -> dict[str, Position]:
-        return {p.symbol: p for p in self._positions.values()
-                if p.strategy == strategy and not p.is_flat}
+    def strategy_positions(self, strategy: str) -> dict[str, Position]:
+        """One strategy's view, keyed by symbol — what its StrategyContext sees."""
+        out: dict[str, Position] = {}
+        for p in self.all_positions():
+            if p.strategy != strategy:
+                continue
+            if p.symbol in out:            # same symbol on two venues: sum quantities
+                prev = out[p.symbol]
+                out[p.symbol] = prev.model_copy(update={
+                    'quantity': prev.quantity + p.quantity, 'avg_entry': None,
+                    'venue': '*'})
+            else:
+                out[p.symbol] = p
+        return out
+
+    def net_quantity(self, venue: str, symbol: str) -> Decimal:
+        """Σ over strategies — what the venue itself should report."""
+        return sum((p.quantity for (v, s, _), p in self._positions.items()
+                    if v == venue and s == symbol), Decimal('0'))
 
     # -- mutation --------------------------------------------------------------
 
@@ -138,13 +164,14 @@ class Portfolio:
                   tolerance: Decimal = Decimal('0.001')) -> list[str]:
         """Diff local state against venue truth. Returns the symbols that disagree.
 
-        The caller MUST halt new entries on a non-empty result and follow RB-02.
-        Venue state is authoritative; never "fix" the venue to match the database.
+        Local = the sum of every strategy's book at that venue. The caller MUST halt
+        new entries on a non-empty result and follow RB-02. Venue state is
+        authoritative; never "fix" the venue to match the database.
         """
         drift: list[str] = []
-        symbols = {s for (v, s) in self._positions if v == venue} | set(venue_positions)
+        symbols = {s for (v, s, _) in self._positions if v == venue} | set(venue_positions)
         for symbol in symbols:
-            local = self.position(venue, symbol).quantity
+            local = self.net_quantity(venue, symbol)
             remote = venue_positions.get(symbol, Decimal('0'))
             denom = max(abs(local), abs(remote), Decimal('1'))
             if abs(local - remote) / denom > tolerance:

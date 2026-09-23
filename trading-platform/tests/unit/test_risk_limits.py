@@ -153,3 +153,31 @@ def test_order_rate_guard():
     engine = RiskEngine(RiskLimits(max_orders_per_min=5))
     state = make_state(orders_this_min={'s4': 5})
     assert not engine.evaluate(make_intent(), state).approved
+
+
+def book(strategy: str, qty: str) -> Position:
+    return Position(venue='binanceusdm', symbol='BTC/USDT:USDT', strategy=strategy,
+                    quantity=Decimal(qty), avg_entry=Decimal('50000'))
+
+
+def test_caps_apply_to_net_exposure_across_strategies():
+    """s1 already holds the full 0.4 cap long: s4's new long entry gets nothing."""
+    state = make_state(positions=[book('s1', '0.4')])
+    decision = RiskEngine().evaluate(make_intent(position='0.3', strategy='s4'), state)
+    assert decision.approved and decision.adjusted_position == 0
+
+
+def test_offsetting_strategy_is_not_capped():
+    """s1 is long 0.4 (at the cap); s4 going short REDUCES net exposure — allow it."""
+    state = make_state(positions=[book('s1', '0.4')])
+    decision = RiskEngine().evaluate(make_intent(position='-0.3', strategy='s4'), state)
+    assert decision.adjusted_position == Decimal('-0.3')
+
+
+def test_strategy_exit_uses_its_own_book_not_the_net():
+    """Net is flat (s1 −0.3, s4 +0.3). s4 exiting must count as reducing ITS book."""
+    engine = RiskEngine()
+    engine.kill.fire('test')
+    state = make_state(positions=[book('s1', '-0.3'), book('s4', '0.3')])
+    decision = engine.evaluate(make_intent(position='0', strategy='s4'), state)
+    assert decision.approved and decision.adjusted_position == 0

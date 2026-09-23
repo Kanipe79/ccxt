@@ -33,7 +33,7 @@ exchange needs hand-holding. Fork *around* the unified layer, not *through* it.
 ```
                          ┌───────────────────────────────────────────┐
                          │             OPERATOR SURFACE              │
-                         │  React dashboard · Telegram · Grafana     │
+                         │  Dashboard · Telegram · Grafana · CLI     │
                          └───────────────┬───────────────────────────┘
                                          │ WS + REST
                          ┌───────────────┴───────────────────────────┐
@@ -139,11 +139,21 @@ Hard rules enforced by the base class:
 ### 3.4 `uxtrader.lab` — backtester
 Two engines with a **cross-validation obligation**: any strategy must produce the same PnL
 (within 2%) on both, or the discrepancy is a bug you must find.
-- **Vectorized** (pandas/numpy/Polars) — for parameter sweeps and Optuna. Fast, approximate
-  fills. Used for *search*, never for the final estimate.
-- **Event-driven** — replays the actual tick/book stream through the same
-  `StrategyBase` the live engine uses, with a realistic matching engine. Used for the
-  *decision*.
+- **Event-driven** (`lab/backtest.py`) — replays events through the same `StrategyBase`,
+  `RiskEngine`, `OrderManager` and `PaperBroker` the live platform uses. Used for the
+  *decision*. Bar-driven intents fill at the **next bar's open** after a sampled latency.
+- **Vectorized** (`lab/vector.py`) — a float loop over arrays with a per-strategy port of
+  the decision logic (currently S4: `donchian_regime.vector_decider`). It reuses the real
+  `RiskEngine` on the rare bars that trade. Used for *search*.
+
+Measured, not assumed (`tests/integration/test_cross_validation.py`): on 3,000 and 12,000
+bars of 4h data the two engines produce **identical** final equity and fill counts,
+including daily-loss halts and a weekly kill. The speed-up is only **~2x**. Once
+`RollingWindow` became O(1) the event engine itself runs at roughly 20k bars/s: 5.5 years
+of 4h bars take about 0.6 s. For bar-based strategies the event engine is fast enough to
+optimize on directly. The vectorized engine earns its place as an *independent check on the
+engine plumbing*: it has already caught one real bug, a pandas unit change that silently
+merged trading days.
 
 Fill realism in the event-driven engine:
 - Market order: fills by walking the recorded L2 book, level by level, plus a latency
@@ -197,6 +207,14 @@ Kill switches must be **trivially triggerable by a human**: one button in the da
 one Telegram command, one CLI invocation — all three hitting L2, not L1.
 
 ### 3.7 `uxtrader.portfolio` — the single source of truth
+**Positions are held per (venue, symbol, strategy).** S1, S4, S5, S6 and S7 all trade the
+BTC perpetual; with one shared net position their target-position intents would
+overwrite each other. Each strategy owns a virtual book, and fills are attributed by the
+strategy on the order. The venue's net position is the sum of those books, and
+reconciliation compares that sum. The risk engine judges an intent against the strategy's
+*own* book (a strategy's exit is always allowed), and applies caps to the portfolio's
+resulting *net* exposure (a strategy trading against the rest of the book is never capped).
+
 Owns positions, average entry, realized/unrealized PnL, per-strategy attribution, and the
 correlation matrix. Reconciles against venue state every 60 seconds. **Strategies and the
 risk engine read positions only from here, never from the exchange directly** — otherwise
@@ -266,10 +284,10 @@ better, it does not belong on this platform.
 | Transactional DB | **PostgreSQL 16** | Orders and fills need ACID. Nothing else qualifies. |
 | Research storage | **Parquet on S3/MinIO**, `polars`/`duckdb` to read | Immutable, versioned, cheap, and readable from a laptop. |
 | Cache / locks | **Redis** | Distributed lock for the execution-engine singleton, hot position cache, rate-limit token buckets shared across processes. |
-| Backtest compute | **Polars** for vectorized, plain Python for event-driven | Polars is 5 – 20x pandas on the group-by-heavy operations a cross-sectional backtest does. |
+| Backtest compute | numpy/pandas + plain Python loops | Measured: the event engine runs ~20k bars/s, and the vectorized engine is ~2x faster than that (§3.4). Polars is worth adding for S2's cross-sectional ranking over 40+ symbols; profile first. |
 | Optimization | **Optuna** (TPE + Hyperband pruning) | Better than grid search at the sample sizes here, and the pruner kills bad trials early. |
 | API | **FastAPI + Pydantic v2** | Schema validation on every boundary; Pydantic models double as the message contracts on NATS. |
-| Dashboard | **React + TypeScript + TanStack Query + lightweight-charts** | `lightweight-charts` (TradingView) is free and renders 100k candles smoothly. Recharts/visx for PnL analytics. WS for live position and PnL updates. |
+| Dashboard | **Implemented:** a single self-contained page served by FastAPI (no build step, no CDN), with WS push. **Planned:** React + TypeScript + lightweight-charts once candle charts and analytics justify a build pipeline. | A trading dashboard's first job is to be available when everything else is on fire. One static file with no third-party scripts has the fewest ways to fail. |
 | Containers | **Docker + Kubernetes** (or Nomad for 1 – 3 nodes) | K8s is genuinely overkill under 5 services; start with `docker compose` and migrate when you have more than one node. Manifests provided either way. |
 | Secrets | **HashiCorp Vault** or **SOPS + age** | API keys never in env vars in a repo, never in the image. Separate keys per environment, IP-allowlisted, withdrawal permission **off**. |
 | Monitoring | **Prometheus + Grafana + Loki + Alertmanager** | Standard, free, and every library you use already exports to it. |
@@ -287,76 +305,40 @@ bottleneck for strategies operating on 15m – 1d signals.
 
 ## 6. Repository structure
 
+As implemented. Items marked *planned* are designed above but not yet written.
+
 ```
-ux-trader/
+trading-platform/
 ├── src/
-│   ├── uxcore/                      # ── the CCXT hard fork layer ──
-│   │   ├── exchange.py              # UXExchange mixin (retry, reconcile, weights)
-│   │   ├── errors.py                # unified taxonomy + retry policy
-│   │   ├── ratelimit.py             # weight-aware adaptive limiter
-│   │   ├── resilience.py            # @resilient, circuit breaker, reconciler
-│   │   ├── ws.py                    # gap detection, resync, staleness watchdog
+│   ├── uxcore/                      # ── the CCXT hard-fork layer ──
+│   │   ├── exchange.py              # UXExchangeMixin + make_exchange(); round_to_market
+│   │   ├── errors.py                # 5-class taxonomy + retry policy; read vs write rules
+│   │   ├── ratelimit.py             # weight-aware limiter, 30% reserve for cancels
+│   │   ├── resilience.py            # @resilient, circuit breaker, ClientIdReconciler
+│   │   ├── ws.py                    # FeedMonitor: staleness + sequence gaps
 │   │   ├── plugin_registry.py       # plugin registry
-│   │   └── plugins/                 # per-venue private endpoints
+│   │   └── plugins/binance_pm.py    # portfolio-margin endpoints (others planned)
 │   └── uxtrader/
-│       ├── types.py                 # Bar, Tick, Intent, Order, Fill, Position (Pydantic)
-│       ├── events.py                # event definitions + NATS subjects
-│       ├── bus.py                   # NATS wrapper, in-memory bus for backtest
-│       ├── clock.py                 # LiveClock / SimClock — the ONLY source of "now"
+│       ├── types.py  events.py  bus.py  clock.py  config.py
 │       ├── strategy.py              # StrategyBase, StrategyContext
-│       ├── engine.py                # strategy engine host + hot reload
-│       ├── portfolio.py             # position/PnL truth, attribution, correlation
-│       ├── risk.py                  # pre-trade gate, limits, kill switch
-│       ├── execution/
-│       │   ├── oms.py               # order state machine, idempotency, reconciliation
-│       │   ├── router.py            # smart order routing
-│       │   ├── algos.py             # Market, PostOnlyPeg, TWAP, POV, Iceberg
-│       │   └── paper.py             # paper broker — same interface as live
-│       ├── data/
-│       │   ├── ingest.py            # WS/REST ingestion
-│       │   ├── store.py             # ClickHouse + Postgres + Parquet access
-│       │   └── universe.py          # point-in-time universe snapshots
-│       ├── lab/
-│       │   ├── backtest.py          # event-driven engine
-│       │   ├── vector.py            # vectorized engine
-│       │   ├── fills.py             # realistic fill/slippage models
-│       │   ├── walkforward.py       # anchored + rolling WFA
-│       │   ├── optimize.py          # Optuna objective + pruning
-│       │   ├── montecarlo.py        # trade-order bootstrap, DSR, PBO
-│       │   └── metrics.py           # Sharpe, Sortino, Calmar, PF, DSR, tail stats
-│       ├── strategies/
-│       │   ├── funding_carry.py     # S1
-│       │   ├── xs_momentum.py       # S2
-│       │   ├── pairs_statarb.py     # S3
-│       │   ├── donchian_regime.py   # S4  ← the fully worked example
-│       │   ├── mr_vwap.py           # S5
-│       │   ├── adaptive_grid.py     # S6
-│       │   └── squeeze_fade.py      # S7
-│       ├── ops/
-│       │   ├── metrics.py           # Prometheus exporters
-│       │   ├── alerts.py            # Telegram/Discord/PagerDuty
-│       │   └── watchdog.py          # L2 out-of-process kill switch
-│       └── api/
-│           ├── main.py              # FastAPI app
-│           └── ws.py                # dashboard WS push
-├── web/                             # React dashboard
-├── config/
-│   ├── config.example.yaml
-│   └── strategies.example.yaml
-├── ops/
-│   ├── docker-compose.yml
-│   ├── Dockerfile
-│   ├── k8s/
-│   └── grafana/
-├── tests/
-│   ├── unit/
-│   ├── integration/                 # against venue testnets
-│   └── regression/                  # deterministic backtest snapshots
-├── notebooks/                       # research only, never imported by src/
+│       ├── portfolio.py             # per-(venue, symbol, strategy) books, attribution
+│       ├── risk.py                  # pre-trade gate, drawdown ladder, kill switch
+│       ├── run.py                   # entry point: --role all|ingest|portfolio|risk|execution|engine
+│       ├── demo.py                  # full platform on a synthetic feed + dashboard
+│       ├── services/                # portfolio, risk, execution, strategy_engine, common (locks, heartbeats)
+│       ├── execution/               # oms, paper, live, algos*, router*
+│       ├── data/                    # ingest (WS), history (backfill), store (Parquet), resample, universe
+│       ├── lab/                     # backtest, vector, fills, metrics (DSR/PBO), walkforward, optimize
+│       ├── strategies/              # S1–S7 + indicators; donchian_regime.py is the reference
+│       ├── ops/                     # watchdog (L2), panic (RB-05), alerts, metrics
+│       └── api/                     # FastAPI app + static dashboard
+├── config/                          # config.example.yaml, strategies.example.yaml
+├── ops/                             # Dockerfile, docker-compose.yml, k8s/, grafana/
+├── tests/                           # unit, uxcore (real ccxt, HTTP stubbed), data, integration, ops, api
 └── docs/
 ```
-
----
+\* `algos.py` and `router.py` exist but are **not yet wired into the OMS**: every order is
+currently a single market or limit order.
 
 ## 7. Key interfaces
 
@@ -416,3 +398,30 @@ of sending to the venue. Consequences:
 
 Run paper and live **side by side on the same signals** during the scale-up phase
 (`docs/03 §6`), and diff the PnL daily. The gap is your true execution cost.
+
+---
+
+## 9. Implementation status
+
+What the code does today, as distinct from the design above. Every "done" item is
+covered by tests (`pytest tests`) and runs offline.
+
+| Component | Status | Notes |
+|---|---|---|
+| `uxcore` taxonomy, limiter, retry, reconcile, breaker | **Done** | Verified against the fork's own ccxt `binanceusdm` (HTTP stubbed): forced 429, forced timeout, lost-then-found orders, unreachable reconciliation |
+| Event-driven backtester | **Done** | Next-bar-open fills, real UTC day/week baselines, risk flattens |
+| Vectorized backtester (S4) | **Done** | Identical results to the event engine; ~2x faster |
+| Risk engine | **Done** except VaR | `var_99_1d` is an input nobody computes yet; the check is inert until the EWMA covariance job exists |
+| Per-strategy books | **Done** | Portfolio, risk, OMS, services |
+| Services over the bus | **Done** | Portfolio, risk, execution, strategy engine; InMemoryBus tested end to end; NatsBus written but **not run against a NATS server here** |
+| Historical loader, Parquet store, resampler | **Done** | Tested through real ccxt parsing |
+| WS ingestion | **Done** | Tested against a scripted ccxt.pro-shaped exchange, not a live socket |
+| Paper broker | **Done** | Market orders walk the book; limit orders need trade prints |
+| Live broker | **Done, untested live** | Rounding, flags, rejections, user-stream fills tested offline |
+| L1 kill (risk) + operator kill → L2 watchdog | **Done** | Dashboard/API kill reaches both |
+| L3 venue-native stops | **Planned** | `StopSpec.venue_native` is carried on intents; nothing places the stop yet |
+| Execution algos (PostOnlyPeg, TWAP, POV) in the OMS | **Planned** | Classes exist; not wired |
+| Smart order routing | **Planned** | `SmartRouter` exists; single default venue today |
+| Alerts, Prometheus metrics, dashboard, API | **Done** | Dashboard verified in Chromium at desktop and phone widths |
+| ClickHouse / Postgres persistence | **Planned** | Research data is Parquet; service state is in memory and rebuilt from venues on start |
+| Real-data validation (G1–G6) of any strategy | **Not started** | The development environment could not reach exchange APIs |

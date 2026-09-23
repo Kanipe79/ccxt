@@ -39,7 +39,7 @@ services:
   md-ingest-binance:
     <<: *common
     build: { context: .., dockerfile: ops/Dockerfile }
-    command: python -m uxtrader.data.ingest --venue binanceusdm
+    command: python -m uxtrader.data.ingest --venue binanceusdm --bus nats://nats:4222 --health-port 8080
     depends_on: [clickhouse, nats]
     healthcheck:                       # restarts a wedged feed — highest-value automation here
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
@@ -50,28 +50,32 @@ services:
   portfolio:
     <<: *common
     build: { context: .., dockerfile: ops/Dockerfile }
-    command: python -m uxtrader.portfolio_service
+    command: python -m uxtrader.run --role portfolio --bus nats://nats:4222 --config /config/config.yaml --strategies /config/strategies.yaml
+    volumes: ["../config:/config:ro"]
     depends_on: [postgres, nats]
 
   risk:
     <<: *common
     build: { context: .., dockerfile: ops/Dockerfile }
-    command: python -m uxtrader.risk_service
+    command: python -m uxtrader.run --role risk --bus nats://nats:4222 --config /config/config.yaml --strategies /config/strategies.yaml
+    volumes: ["../config:/config:ro"]
     depends_on: [nats, portfolio]
 
   execution:
     <<: *common
     build: { context: .., dockerfile: ops/Dockerfile }
-    command: python -m uxtrader.execution_service
+    command: python -m uxtrader.run --role execution --bus nats://nats:4222 --config /config/config.yaml --strategies /config/strategies.yaml
+    volumes: ["../config:/config:ro"]
     depends_on: [nats, risk, redis]
     deploy: { replicas: 1 }            # SINGLETON. Never scale this. Redis lock backs it up.
+    environment: { UX_LOCK_BACKEND: "redis://redis:6379/1" }
 
   strategy-engine:
     <<: *common
     build: { context: .., dockerfile: ops/Dockerfile }
-    command: python -m uxtrader.engine --config /config/strategies.yaml
-    depends_on: [nats, risk]
+    command: python -m uxtrader.run --role engine --bus nats://nats:4222 --config /config/config.yaml --strategies /config/strategies.yaml
     volumes: ["../config:/config:ro"]
+    depends_on: [nats, risk]
 
   watchdog:
     # Kill-switch L2. Separate image, separate credentials, separate failure domain.
@@ -80,16 +84,17 @@ services:
     image: python:3.12-slim
     env_file: [../.env.watchdog]
     command: >
-      sh -c "pip install --no-cache-dir ccxt && python -m uxtrader.ops.watchdog"
+      sh -c "pip install --no-cache-dir ccxt nats-py && python -m uxtrader.ops.watchdog"
     volumes: ["../src:/app/src:ro"]
     working_dir: /app
-    environment: { PYTHONPATH: /app/src }
+    environment: { PYTHONPATH: /app/src, WATCHDOG_NATS: "nats://nats:4222" }
     networks: [ux]
 
   api:
     <<: *common
     build: { context: .., dockerfile: ops/Dockerfile }
     command: uvicorn uxtrader.api.main:app --host 0.0.0.0 --port 8000
+    environment: { UX_BUS: "nats://nats:4222" }   # UX_API_TOKEN comes from .env; unset = controls disabled
     ports: ["8000:8000"]
     depends_on: [postgres, nats]
 

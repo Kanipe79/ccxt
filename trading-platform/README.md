@@ -46,14 +46,18 @@ scalping, indicator-soup ML on OHLCV, social-sentiment alpha, copy trading. Reas
 
 ```
 src/uxcore/        the CCXT fork layer — rate limiting, error taxonomy, WS resilience, plugins
-src/uxtrader/      the platform — strategies, risk, execution, portfolio, backtester
+src/uxtrader/      the platform
   strategies/      S1–S7. Read donchian_regime.py first: it is the worked reference.
-  lab/             backtester, fill models, walk-forward, DSR/PBO, Optuna
-  execution/       OMS, routing, algos, paper broker
-  ops/             watchdog (kill-switch L2), panic flatten (RB-05)
+  services/        portfolio, risk, execution, strategy engine — one process or one container each
+  lab/             event-driven + vectorized backtesters, fill models, walk-forward, DSR/PBO, Optuna
+  execution/       OMS, paper and live brokers, algos, router
+  data/            WS ingestion, historical backfill, Parquet store, resampler, PIT universe
+  ops/             watchdog (kill-switch L2), panic flatten (RB-05), alerts, metrics
+  api/             operator API + dashboard
+  run.py, demo.py  entry points
 config/            example configuration
 ops/               Dockerfile, docker-compose, k8s manifests, Prometheus alerts
-tests/             unit + integration
+tests/             unit, uxcore (real ccxt), data, integration (incl. cross-validation), ops, api
 docs/              the seven documents above
 ```
 
@@ -77,36 +81,46 @@ you needed.
 
 ```bash
 pip install -e ".[dev]"
-pytest tests -q                       # 31 tests, all offline
+# The fork's own ccxt is used when you run from inside it:
+export PYTHONPATH=src:../python
 
-# run S4 through the backtester on synthetic bars
-PYTHONPATH=src python -c "
-import asyncio, sys; sys.path.insert(0, 'tests/integration')
-from test_backtest_smoke import synthetic_bars, S4, START
-from uxtrader.lab.backtest import EventDrivenBacktester
-from decimal import Decimal
-r = asyncio.run(EventDrivenBacktester(starting_equity=Decimal('100000')).run(
-    S4, synthetic_bars(), start=START))
-print(f'intents={len(r.intents)} fills={len(r.fills)} final={r.final_equity:,.0f}')
-print(r.attribution)"
+pytest tests -q                              # offline; the uxcore tests use the fork's real ccxt
 
-# full single-node stack
-docker compose -f ops/docker-compose.yml up -d
+python -m uxtrader.demo --token demo         # full platform on a synthetic feed
+#   → http://127.0.0.1:8765  (dashboard; controls use the token)
+
+# Backfill real history (needs network access to the venue):
+python -m uxtrader.data.history --venue binanceusdm --symbols BTC/USDT:USDT \
+    --timeframe 4h --since 2021-01-01 --out ./data --funding
+
+# Paper trading, one process:
+cp config/config.example.yaml config/config.yaml
+cp config/strategies.example.yaml config/strategies.yaml
+python -m uxtrader.run --role all
 ```
+
+Run modes and the multi-container layout are in `docs/04-deployment-operations.md §3`.
 
 ## Status
 
-This is a **design and scaffold**, not a running trading system. What exists and is
-verified: the domain model, risk engine, portfolio accounting, fill simulation, the
-event-driven backtester, all seven strategy implementations, and the safety modules —
-with 31 passing tests including an end-to-end backtest that exercises the real wiring
-(signal → risk gate → OMS → paper fill → PnL attribution).
+**Built and tested (all offline):**
+- **The fork layer:** `uxcore`, checked against this fork's own ccxt `binanceusdm` with only HTTP stubbed. Forced 429s, timeouts that landed or didn't, and unreachable reconciliation are all handled correctly.
+- **Backtesting:** both backtesters. They agree exactly on S4, including risk halts and flattens.
+- **Services:** portfolio, risk, execution and strategy engine talking over a message bus. Per-strategy books, operator kill → flatten → rearm, daily-loss halt and stale-feed blocking are tested end to end.
+- **Data:** the historical loader, immutable Parquet store, WS ingestion and bar resampler.
+- **Brokers:** paper and live, the live one tested offline only.
+- **Ops:** alerts, Prometheus metrics, the operator API, and a dashboard verified in Chromium at desktop and phone widths.
+- **Safety:** the L2 watchdog, which also acts on a global operator kill.
 
-What does **not** exist yet: the data ingestion service, the NATS wiring between
-processes, the live broker, the FastAPI/React dashboard, and the vectorized backtester.
-Those are Phases 1 – 5 in `docs/06-roadmap.md`. The module paths referenced by
-`ops/docker-compose.yml` (`uxtrader.data.ingest`, `uxtrader.risk_service`, …) are the
-intended entry points for that work, not existing modules.
+**Not built yet:**
+- L3 venue-native stop orders
+- execution algos and smart routing wired into the OMS
+- the portfolio VaR computation
+- ClickHouse/Postgres persistence (service state is in memory and rebuilt from venues)
+- a React dashboard
 
-No strategy in this repository has been validated on real data. Every one of them must
-pass gates G1 – G6 in `docs/03` before it sees capital.
+**Not done at all:** validation of any strategy on real market data. The development
+environment could not reach exchange APIs, so every performance figure in `docs/` is
+still a prior. Run the backfill above, then the G1–G6 pipeline in `docs/03`.
+
+Full component-by-component status: `docs/02-architecture.md §9`.

@@ -33,6 +33,10 @@ class PaperBroker:
         self._open: dict[str, Order] = {}
         self._positions: dict[tuple[str, str], Decimal] = {}
 
+    def set_fill_handler(self, handler: Callable[[Fill], Awaitable[None]]) -> None:
+        """Late binding: the OMS needs the broker, and the broker reports to the OMS."""
+        self._on_fill = handler
+
     async def submit(self, order: Order) -> Order:
         book = self._books(order.venue, order.symbol)
         if book is None:

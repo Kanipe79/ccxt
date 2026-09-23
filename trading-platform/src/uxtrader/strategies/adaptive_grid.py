@@ -17,7 +17,7 @@ from decimal import Decimal
 
 from ..strategy import StrategyBase, StrategyContext
 from ..types import AlgoKind, AlgoSpec, Bar, Intent
-from .indicators import ADX, ATR, EMA, RollingWindow, dec
+from .indicators import ADX, ATR, EMA, RollingWindow
 
 log = logging.getLogger(__name__)
 

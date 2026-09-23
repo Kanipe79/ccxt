@@ -32,7 +32,7 @@ from typing import Any
 from uxcore.ws import FeedMonitor
 
 from ..bus import Bus
-from ..events import FEED_STALE, StaleFeed, md_subject
+from ..events import FEED_RECOVERED, FEED_STALE, FeedRecovered, StaleFeed, md_subject
 from ..types import Bar, BookLevel, BookSnapshot, Funding, TradeTick
 
 log = logging.getLogger(__name__)
@@ -114,7 +114,11 @@ class IngestService:
 
     async def _seen(self, key: str) -> None:
         await self.monitor.observe(key)
-        self._stale_published.discard(key)
+        if key in self._stale_published:
+            self._stale_published.discard(key)
+            _, symbol, _ = key.split('|', 2)
+            await self.bus.publish(FEED_RECOVERED, FeedRecovered(
+                key=key, venue=self.venue, symbol=symbol))
 
     async def _on_stale(self, key: str, age: float) -> None:
         if key in self._stale_published:
