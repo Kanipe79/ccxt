@@ -80,47 +80,57 @@ you needed.
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"
-# The fork's own ccxt is used when you run from inside it:
-export PYTHONPATH=src:../python
-
-pytest tests -q                              # offline; the uxcore tests use the fork's real ccxt
-
-python -m uxtrader.demo --token demo         # full platform on a synthetic feed
-#   → http://127.0.0.1:8765  (dashboard; controls use the token)
-
-# Backfill real history (needs network access to the venue):
-python -m uxtrader.data.history --venue binanceusdm --symbols BTC/USDT:USDT \
-    --timeframe 4h --since 2021-01-01 --out ./data --funding
-
-# Paper trading, one process:
-cp config/config.example.yaml config/config.yaml
-cp config/strategies.example.yaml config/strategies.yaml
-python -m uxtrader.run --role all
+./start.sh            # first run creates .venv, installs this fork's ccxt + the platform
+                      # then opens the dashboard: pick Demo → Start
+./start.sh demo       # same, with a demo run started for you
+./start.sh doctor     # check python, ccxt source, network reach, API keys
 ```
 
-Run modes and the multi-container layout are in `docs/04-deployment-operations.md §3`.
+Windows: `start.bat`. Already installed? Everything is the `ux` command:
+
+```bash
+ux                    # dashboard at http://127.0.0.1:8765 (a sign-in link is printed)
+ux backfill --venue binanceusdm --symbols BTC/USDT:USDT --timeframe 4h --since 2021-01-01
+ux run --role risk --bus nats://nats:4222      # headless, one service per container
+ux panic --venues binanceusdm                  # emergency flatten from any machine
+```
+
+From the dashboard you choose **Demo** (synthetic market, no keys, no network), **Paper**
+(real market data, simulated fills) or **Live** (real orders; needs keys in env vars and
+typing LIVE to confirm). Then pick strategies and risk budgets and press Start. Stop from the
+top bar, with or without flattening. History (equity, fills, events) is journaled to
+`~/.uxtrader/journal.db` and survives restarts. The dashboard binds to localhost only, and
+control actions need the per-start token that the printed link carries.
+
+Tests: `pip install -e ".[dev]" && pytest tests -q`. Set `UX_NATS_SERVER=/path/to/nats-server`
+to include the real-NATS integration tests.
 
 ## Status
 
-**Built and tested (all offline):**
-- **The fork layer:** `uxcore`, checked against this fork's own ccxt `binanceusdm` with only HTTP stubbed. Forced 429s, timeouts that landed or didn't, and unreachable reconciliation are all handled correctly.
-- **Backtesting:** both backtesters. They agree exactly on S4, including risk halts and flattens.
-- **Services:** portfolio, risk, execution and strategy engine talking over a message bus. Per-strategy books, operator kill → flatten → rearm, daily-loss halt and stale-feed blocking are tested end to end.
-- **Data:** the historical loader, immutable Parquet store, WS ingestion and bar resampler.
+**Built and tested** (156 tests, all offline except the 4 that run against a real nats-server):
+- **Launcher:** the `ux` command and `./start.sh`, verified from a clean checkout in about 40 s. The launcher supervises demo/paper/live runs inside the dashboard process.
+- **Dashboard:** launch flow, overview, markets (candles with the bot's fills), strategies, risk (limits, kill/flatten/rearm, safety layers) and activity. Verified in Chromium at 1440 px and 390 px, light and dark, with no console errors and no horizontal scroll.
+- **The fork layer:** `uxcore`, checked against this fork's own ccxt `binanceusdm` with HTTP stubbed.
+- **Backtesting:** the event-driven and vectorized backtesters agree exactly across 12 seeds, a 5.5-year history and a thin-book case.
+- **Services:** portfolio, risk, execution and strategy engine, on the in-memory bus *and* on real NATS (one connection per service).
+- **Safety:** all three kill-switch layers — the risk service (L1), the out-of-process watchdog (L2), and venue-native stop orders (L3) that trail the strategy's stop, including the Binance USD-M algo-order endpoint.
+- **Risk:** portfolio VaR, conservative — it nets spot against perp and assumes correlation 1 across assets.
+- **Data and records:** the SQLite journal, historical loader, Parquet store, WS ingestion and resampler.
 - **Brokers:** paper and live, the live one tested offline only.
-- **Ops:** alerts, Prometheus metrics, the operator API, and a dashboard verified in Chromium at desktop and phone widths.
-- **Safety:** the L2 watchdog, which also acts on a global operator kill.
 
-**Not built yet:**
-- L3 venue-native stop orders
-- execution algos and smart routing wired into the OMS
-- the portfolio VaR computation
-- ClickHouse/Postgres persistence (service state is in memory and rebuilt from venues)
-- a React dashboard
+**Runnable from the launcher:** S4 (trend), S6 (grid), S5 (maker mean reversion; needs a
+live order book, so paper/live only), plus a demo-only toy strategy.
+**Implemented but not launchable yet:** S1 needs a spot venue for its hedge leg; until one is configured it
+refuses to trade rather than run a naked short. S2 needs a universe job, S3 a pair screen,
+and S7 an open-interest feed. The dashboard shows each one with the reason.
 
-**Not done at all:** validation of any strategy on real market data. The development
-environment could not reach exchange APIs, so every performance figure in `docs/` is
-still a prior. Run the backfill above, then the G1–G6 pipeline in `docs/03`.
+**Still not built:**
+- execution algos (TWAP/peg) and smart routing wired into the OMS
+- a covariance-based VaR
+- Postgres/ClickHouse (SQLite and Parquet cover single-box use)
+
+**Not done at all:** validation of any strategy on real market data. The build environment
+cannot reach exchange APIs, so every performance figure in `docs/` is still a prior.
+Run `ux backfill`, then the G1–G6 pipeline in `docs/03`.
 
 Full component-by-component status: `docs/02-architecture.md §9`.

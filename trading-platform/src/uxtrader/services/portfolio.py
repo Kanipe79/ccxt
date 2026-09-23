@@ -18,8 +18,9 @@ log = logging.getLogger(__name__)
 
 
 class PortfolioService:
-    def __init__(self, bus: Bus, starting_equity: Decimal) -> None:
+    def __init__(self, bus: Bus, starting_equity: Decimal, *, clock=None) -> None:
         self.bus = bus
+        self.clock = clock
         self.portfolio = Portfolio(starting_equity)
         self.seq = 0
         self._day = self._week = None
@@ -36,7 +37,9 @@ class PortfolioService:
         return PortfolioSnapshot(
             seq=self.seq, equity=p.equity, peak_equity=p.peak_equity,
             day_start_equity=self.day_start, week_start_equity=self.week_start,
-            positions=tuple(p.all_positions()), marks=dict(p.marks))
+            positions=tuple(p.all_positions()), marks=dict(p.marks),
+            attribution=p.attribution(),
+            **({'ts': self.clock.now()} if self.clock is not None else {}))
 
     async def publish(self) -> None:
         await self.bus.publish(PORTFOLIO_SNAPSHOT, self.snapshot())

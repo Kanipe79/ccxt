@@ -37,18 +37,13 @@ sops --decrypt config/secrets.enc.yaml > /run/secrets/config.yaml
 
 ## 3. Local / single-node deployment
 
-### 3.0 Three ways to run it
+### 3.0 Ways to run it
 
 ```bash
-# (a) See it working — synthetic market, no keys, no network:
-python -m uxtrader.demo --port 8765 --token demo          # http://127.0.0.1:8765
-
-# (b) Paper trading, one process, in-memory bus, real market data:
-cp config/config.example.yaml config/config.yaml           # mode: paper
-cp config/strategies.example.yaml config/strategies.yaml
-python -m uxtrader.run --role all
-
-# (c) One service per container over NATS — see the compose file below.
+./start.sh                  # first run bootstraps .venv; opens the dashboard → Demo/Paper/Live → Start
+./start.sh demo             # dashboard + a demo run already started
+ux run --role all           # headless, one process, config/config.yaml + strategies.yaml
+# one service per container over NATS — see the compose file below
 ```
 
 Warm-up: the engine role backfills each strategy's `warmup_bars` over REST before it

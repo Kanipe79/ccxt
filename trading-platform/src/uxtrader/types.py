@@ -203,6 +203,7 @@ class Order(BaseModel):
     type: str                    # 'limit' | 'market' | 'stop_market' ...
     amount: Decimal
     price: Decimal | None = None
+    stop_price: Decimal | None = None    # trigger for 'stop_market' (kill-switch layer L3)
     state: OrderState = OrderState.PENDING_NEW
     filled: Decimal = Decimal('0')
     avg_price: Decimal | None = None

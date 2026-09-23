@@ -31,6 +31,7 @@ class PaperBroker:
         self._on_fill = on_fill
         self._adv = adv_lookup or (lambda _s: 0.0)
         self._open: dict[str, Order] = {}
+        self._stops: dict[str, Order] = {}
         self._positions: dict[tuple[str, str], Decimal] = {}
 
     def set_fill_handler(self, handler: Callable[[Fill], Awaitable[None]]) -> None:
@@ -47,6 +48,14 @@ class PaperBroker:
             # Exactly what the venue does. A paper broker that silently accepts a
             # crossing post-only order will make S5 look profitable when it is not.
             return order.model_copy(update={'state': OrderState.REJECTED})
+
+        if order.type == 'stop_market':
+            if order.stop_price is None:
+                return order.model_copy(update={'state': OrderState.REJECTED})
+            resting = order.model_copy(update={'state': OrderState.NEW,
+                                               'updated_at': self.clock.now()})
+            self._stops[order.client_order_id] = resting
+            return resting
 
         if order.type == 'market':
             filled, avg, fee = self.sim.fill_market(order, book, self._adv(order.symbol))
@@ -88,13 +97,39 @@ class PaperBroker:
                 self._open.pop(coid, None)
             await self._emit_fill(updated, px, filled, fee, is_maker=True)
 
+    async def on_price(self, venue: str, symbol: str, price: Decimal) -> int:
+        """Trigger resting stops. Called on every trade print and bar close; a
+        triggered stop becomes a market order against the current book, exactly as
+        the venue would execute it — including the slippage of a stop in a fast move."""
+        fired = 0
+        for coid, stop in list(self._stops.items()):
+            if stop.venue != venue or stop.symbol != symbol or stop.stop_price is None:
+                continue
+            hit = ((stop.side == 'sell' and price <= stop.stop_price)
+                   or (stop.side == 'buy' and price >= stop.stop_price))
+            if not hit:
+                continue
+            del self._stops[coid]
+            book = self._books(venue, symbol)
+            if book is None:
+                continue
+            filled, avg, fee = self.sim.fill_market(stop, book, self._adv(symbol))
+            if filled <= 0:
+                continue
+            done = stop.model_copy(update={'state': OrderState.FILLED, 'filled': filled,
+                                           'avg_price': avg, 'updated_at': self.clock.now()})
+            await self._emit_fill(done, avg, filled, fee, is_maker=False)
+            fired += 1
+        return fired
+
     async def cancel(self, order: Order) -> Order:
+        self._stops.pop(order.client_order_id, None)
         self._open.pop(order.client_order_id, None)
         return order.model_copy(update={'state': OrderState.CANCELED,
                                         'updated_at': self.clock.now()})
 
     async def fetch_open_orders(self, venue: str, symbol: str | None = None) -> list[Order]:
-        return [o for o in self._open.values()
+        return [o for o in list(self._open.values()) + list(self._stops.values())
                 if o.venue == venue and (symbol is None or o.symbol == symbol)]
 
     async def fetch_positions(self, venue: str) -> dict[str, Decimal]:

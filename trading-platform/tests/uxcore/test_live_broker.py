@@ -86,3 +86,22 @@ async def test_external_fill_is_recorded_not_dropped(ex):
         'id': 'x9', 'order': '999', 'symbol': SYM, 'side': 'sell', 'price': 1, 'amount': 1,
         'timestamp': 0, 'info': {}})
     assert got and got[0].strategy == 'external'
+
+
+async def test_stop_market_goes_to_binance_algo_endpoint_and_cancels_there(ex, transport):
+    algo = {'algoId': 777, 'clientAlgoId': 'uxsstop01', 'symbol': 'BTCUSDT', 'side': 'SELL',
+            'orderType': 'STOP_MARKET', 'quantity': '0.012', 'triggerPrice': '48755',
+            'algoStatus': 'NEW', 'createTime': 1_700_000_000_000}
+    transport.on('POST', 'fapi/v1/algoOrder', algo)
+    transport.on('DELETE', 'fapi/v1/algoOrder', dict(algo, algoStatus='CANCELED'))
+    broker = LiveBroker({'binanceusdm': ex})
+    order = make_order(client_order_id='uxsstop01', side='sell', type='stop_market',
+                       price=None, stop_price=Decimal('48755.03'), reduce_only=True)
+    placed = await broker.submit(order)
+    body = transport.bodies('POST', 'fapi/v1/algoOrder')[0]
+    assert 'type=STOP_MARKET' in body and 'triggerPrice=48755' in body
+    assert 'algoType=CONDITIONAL' in body and 'reduceOnly=true' in body
+    assert placed.venue_order_id == '777'
+    await broker.cancel(placed)
+    assert transport.count('DELETE', 'fapi/v1/algoOrder') == 1
+    assert transport.count('DELETE', 'fapi/v1/order') == 0

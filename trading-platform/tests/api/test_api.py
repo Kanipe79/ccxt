@@ -64,4 +64,4 @@ def test_websocket_pushes_events():
     with TestClient(app) as client, client.websocket_connect('/ws') as ws:
         client.portal.call(bus.publish, 'control.kill', Control(command='kill', reason='drill'))
         msg = ws.receive_json()
-        assert msg['type'] == 'Control' and msg['data']['reason'] == 'drill'
+        assert msg == {'type': 'Control', 'subject': 'control.kill'}

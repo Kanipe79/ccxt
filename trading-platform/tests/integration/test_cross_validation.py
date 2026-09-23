@@ -57,7 +57,7 @@ async def run_both(df: pd.DataFrame):
     return ev, vec, t_event, t_vec
 
 
-@pytest.mark.parametrize('seed', [1, 2, 3, 4, 5])
+@pytest.mark.parametrize('seed', list(range(1, 13)))
 async def test_engines_agree_within_two_percent(seed):
     df = regime_series(3000, seed)
     ev, vec, _, _ = await run_both(df)
@@ -82,10 +82,22 @@ async def test_equity_curves_track_bar_by_bar():
 async def test_risk_ladder_agrees_over_long_history():
     """~5.5 years of 4h bars through a crash regime: exercises the daily-loss halt,
     its midnight expiry, and the weekly kill in BOTH engines. This is the case that
-    caught a pandas-version bug (asi8 in µs, not ns) that silently merged 'days'."""
-    df = regime_series(12000, 11)
+    caught a pandas-version bug (asi8 in µs, not ns) that silently merged 'days', and
+    (seed sweep) a partial-fill mismatch when an order exceeded synthetic book depth."""
+    df = regime_series(12000, 9)
     ev, vec, _, _ = await run_both(df)
     assert ev.risk_flattens, 'scenario no longer exercises the risk ladder'
     assert [r for _, r in ev.risk_flattens] == [r for _, r in vec.risk_flattens]
+    assert ev.final_equity == pytest.approx(vec.final_equity, rel=1e-6)
+    assert len(ev.fills) == len(vec.fills)
+
+
+async def test_orders_larger_than_the_book_fill_partially_in_both():
+    """A cheap asset makes S4 size in thousands of units; both engines must fill only
+    what the synthetic book holds and agree on the remainder being dropped."""
+    df = regime_series(3000, 17)
+    for col in ('open', 'high', 'low', 'close'):
+        df[col] = df[col] / 60                       # ~$500 asset
+    ev, vec, _, _ = await run_both(df)
     assert ev.final_equity == pytest.approx(vec.final_equity, rel=1e-6)
     assert len(ev.fills) == len(vec.fills)

@@ -209,12 +209,14 @@ class DonchianRegime(StrategyBase):
         peak = self._peak.get(s, entry)
         peak = max(peak, close) if direction == 1 else min(peak, close)
         self._peak[s] = peak
+        stop_moved = False
         if r_multiple >= 1.0:
             trail = peak - direction * self.STOP_ATR_MULT * atr
             breakeven = entry
             candidate = max(trail, breakeven) if direction == 1 else min(trail, breakeven)
             if (direction == 1 and candidate > stop) or (direction == -1 and candidate < stop):
                 self._stop[s] = candidate
+                stop_moved = True
 
         # partial at +2R
         if r_multiple >= 2.0 and not self._took_partial[s]:
@@ -233,6 +235,11 @@ class DonchianRegime(StrategyBase):
                                     reason=f'pyramid #{n} at +{r_multiple:.1f}R',
                                     algo=AlgoSpec(kind=AlgoKind.MARKET),
                                     stop=StopSpec(price=dec(entry)))]
+        if stop_moved:
+            # Same position, new stop: moves the venue-native backstop (L3) up behind
+            # the trail. Risk approves zero-change intents unconditionally.
+            return [self.target(s, position, reason=f'trail stop → {self._stop[s]:.2f}',
+                                stop=StopSpec(price=dec(self._stop[s])))]
         return []
 
     # -- helpers ----------------------------------------------------------------
@@ -361,11 +368,13 @@ def vector_decider(bars, params: dict | None = None, *, risk_budget: float = 1.0
             peak = st['peak'] if st['peak'] is not None else entry
             peak = max(peak, close) if direction == 1 else min(peak, close)
             st['peak'] = peak
+            moved = False
             if r >= 1.0:
                 trail = peak - direction * k * a
                 cand = max(trail, entry) if direction == 1 else min(trail, entry)
                 if (direction == 1 and cand > stop) or (direction == -1 and cand < stop):
                     st['stop'] = cand
+                    moved = True
             if r >= 2.0 and not st['partial']:
                 st['partial'] = True
                 return pos / 2
@@ -375,7 +384,7 @@ def vector_decider(bars, params: dict | None = None, *, risk_budget: float = 1.0
                     add = size(equity, r_unit, rf * 0.5)
                     st['stop'] = entry
                     return pos + add * direction
-            return None
+            return pos if moved else None          # stop-only update, as on_bar emits
 
         if np.isnan(ema[t]) or np.isnan(adx[t]) or np.isnan(vf[t]) or np.isnan(vs[t]):
             return None

@@ -222,6 +222,11 @@ class RiskEngine:
         if is_reducing(have, target):
             return RiskDecision(intent_id=intent.intent_id, approved=True,
                                 adjusted_position=target, note='risk-reducing')
+        # Zero-change intents only move a protective stop. Blocking one would leave
+        # the old, looser stop resting at the venue.
+        if target == have and have != 0:
+            return RiskDecision(intent_id=intent.intent_id, approved=True,
+                                adjusted_position=target, note='stop update')
 
         # 1. kill switch — cheapest check first
         blocked = self.kill.blocked(intent.strategy, intent.venue)
@@ -337,3 +342,71 @@ class RiskEngine:
             breaches=(LimitBreach(limit=limit, observed=observed, allowed=allowed),),
             note=note or limit,
         )
+
+
+def underlying(symbol: str) -> str:
+    """'BTC/USDT:USDT' and 'BTC/USDT' → 'BTC'. Spot and perp of one asset are one risk."""
+    return symbol.split('/')[0].split(':')[0]
+
+
+class VarModel:
+    """Conservative one-day 99% VaR.
+
+    * Per-underlying volatility from an EWMA of squared log returns, normalised by
+      elapsed *market* time (bar timestamps, never wall clock), so 1m and 4h inputs give
+      the same daily number.
+    * Positions are netted per underlying first: a delta-neutral carry trade (long
+      spot, short perp) is close to zero risk, not twice the risk.
+    * Across underlyings, correlation is taken as 1, which is an upper bound. That is
+      deliberately pessimistic until a proper covariance estimate exists, and it is
+      honest about being one.
+    * Until an underlying has ``min_samples`` returns, it uses ``prior_annual_vol``
+      (100%): unknown assets are assumed to be volatile.
+    """
+
+    Z99 = 2.326
+
+    def __init__(self, halflife_samples: float = 500.0, min_samples: int = 30,
+                 prior_annual_vol: float = 1.0) -> None:
+        import math
+        self.alpha = 1 - math.exp(-math.log(2) / halflife_samples)
+        self.min_samples = min_samples
+        self.prior_rate = prior_annual_vol ** 2 / (365 * 86400)     # variance per second
+        self._last: dict[str, tuple[float, float]] = {}             # und → (price, ts)
+        self._rate: dict[str, float] = {}
+        self._n: dict[str, int] = {}
+
+    def update(self, symbol: str, price: float, ts: datetime) -> None:
+        import math
+        und = underlying(symbol)
+        t = ts.timestamp()
+        prev = self._last.get(und)
+        self._last[und] = (price, t)
+        if prev is None or price <= 0 or prev[0] <= 0 or t <= prev[1]:
+            return
+        r = math.log(price / prev[0])
+        rate = r * r / (t - prev[1])
+        old = self._rate.get(und)
+        self._rate[und] = rate if old is None else self.alpha * rate + (1 - self.alpha) * old
+        self._n[und] = self._n.get(und, 0) + 1
+
+    def daily_vol(self, symbol: str) -> float:
+        und = underlying(symbol)
+        rate = self._rate.get(und) if self._n.get(und, 0) >= self.min_samples else None
+        return ((rate if rate is not None else self.prior_rate) * 86400) ** 0.5
+
+    def var_99(self, positions: list[Position], marks: dict[str, Decimal],
+               equity: Decimal) -> float:
+        if equity <= 0:
+            return 0.0
+        net: dict[str, float] = {}
+        rep: dict[str, str] = {}
+        for p in positions:
+            mark = marks.get(p.symbol)
+            if mark is None:
+                continue
+            und = underlying(p.symbol)
+            net[und] = net.get(und, 0.0) + float(p.quantity * mark)
+            rep.setdefault(und, p.symbol)
+        sigma = sum(abs(n) * self.daily_vol(rep[u]) for u, n in net.items())
+        return self.Z99 * sigma / float(equity)

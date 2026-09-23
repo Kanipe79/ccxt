@@ -14,6 +14,8 @@ Subject layout (NATS-style tokens, ``*`` = one token, ``>`` = the rest)::
     fill.{venue}                   execution → portfolio, strategies
     feed.stale / feed.recovered    ingest → risk, execution, strategies
     portfolio.snapshot             portfolio → risk, execution, strategy engine
+    strategy.status                strategy engine → UI (warm-up, last decision)
+    risk.status                    risk → UI (limits, utilisation, kill state, VaR)
     control.{command}              operator → services (kill, rearm, flatten)
     heartbeat.{service}            every service → watchdog
 """
@@ -51,6 +53,8 @@ RISK_VETO = 'risk.veto'
 FEED_STALE = 'feed.stale'
 FEED_RECOVERED = 'feed.recovered'
 PORTFOLIO_SNAPSHOT = 'portfolio.snapshot'
+STRATEGY_STATUS = 'strategy.status'
+RISK_STATUS = 'risk.status'
 CONTROL_KILL = 'control.kill'
 CONTROL_REARM = 'control.rearm'
 
@@ -92,10 +96,45 @@ class PortfolioSnapshot(BaseModel):
     week_start_equity: Decimal
     positions: tuple[Position, ...]
     marks: dict[str, Decimal]
+    attribution: dict[str, dict[str, float]] = Field(default_factory=dict)
     ts: datetime = Field(default_factory=utcnow)
 
     def position_map(self) -> dict[str, Position]:
         return {p.symbol: p for p in self.positions}
+
+
+class StrategyStatus(BaseModel):
+    """What the UI needs to show a strategy card: is it warm, what did it last decide."""
+    model_config = ConfigDict(frozen=True)
+    name: str
+    cls: str
+    description: str = ''
+    timeframe: str
+    symbols: tuple[str, ...]
+    stage: int
+    risk_budget: float                 # effective (after staging)
+    bars_seen: int
+    warmup_bars: int
+    last_reason: str | None = None
+    last_intent_at: datetime | None = None
+    ts: datetime = Field(default_factory=utcnow)
+
+    @property
+    def warm(self) -> bool:
+        return self.bars_seen >= self.warmup_bars
+
+
+class RiskStatus(BaseModel):
+    """Everything the risk page draws: limits, how much of each is used, kill state."""
+    model_config = ConfigDict(frozen=True)
+    kill_global: bool
+    disabled_strategies: tuple[str, ...] = ()
+    disabled_venues: tuple[str, ...] = ()
+    halted_until: datetime | None = None
+    limits: dict[str, float] = Field(default_factory=dict)
+    usage: dict[str, float] = Field(default_factory=dict)   # same keys, observed values
+    stale_symbols: tuple[str, ...] = ()
+    ts: datetime = Field(default_factory=utcnow)
 
 
 class Control(BaseModel):
@@ -127,7 +166,7 @@ REGISTRY: dict[str, type[BaseModel]] = {
     cls.__name__: cls
     for cls in (Bar, TradeTick, BookSnapshot, Funding, Intent, RiskDecision, Order,
                 Fill, StaleFeed, FeedRecovered, PortfolioSnapshot, Control, Heartbeat,
-                ApprovedIntent)
+                ApprovedIntent, StrategyStatus, RiskStatus)
 }
 
 

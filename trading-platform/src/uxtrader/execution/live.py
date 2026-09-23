@@ -46,6 +46,8 @@ class LiveBroker:
 
     async def submit(self, order: Order) -> Order:
         ex = self.ex[order.venue]
+        if order.type == 'stop_market':
+            return await self._submit_stop(order)
         amount, price = ex.round_to_market(order.symbol, order.amount, order.price)
         if amount <= 0:
             log.warning('order_below_venue_minimum coid=%s amount=%s',
@@ -72,11 +74,37 @@ class LiveBroker:
             self._orders_by_venue_id[(order.venue, merged.venue_order_id)] = merged
         return merged
 
+    async def _submit_stop(self, order: Order) -> Order:
+        """Venue-native stop-market (L3). ccxt's unified ``triggerPrice`` routes it to
+        the venue's conditional-order API (Binance USD-M: fapi/v1/algoOrder)."""
+        ex = self.ex[order.venue]
+        amount, stop = ex.round_to_market(order.symbol, order.amount, order.stop_price)
+        if amount <= 0 or stop is None:
+            return order.model_copy(update={'state': OrderState.REJECTED})
+        params: dict[str, Any] = {'triggerPrice': float(stop)}
+        if order.reduce_only:
+            params['reduceOnly'] = True
+        try:
+            raw = await ex.ux_create_order(order.symbol, 'market', order.side, float(amount),
+                                           None, client_order_id=order.client_order_id,
+                                           params=params)
+        except UXError as err:
+            if err.klass is ErrorClass.REJECTED:
+                log.error('stop_rejected coid=%s err=%s', order.client_order_id, err)
+                return order.model_copy(update={'state': OrderState.REJECTED})
+            raise
+        merged = self._merge(order.model_copy(update={'amount': amount, 'stop_price': stop}), raw)
+        if merged.venue_order_id:
+            self._orders_by_venue_id[(order.venue, merged.venue_order_id)] = merged
+        return merged
+
     async def cancel(self, order: Order) -> Order:
         if not order.venue_order_id:
             return order.model_copy(update={'state': OrderState.CANCELED})
+        params = {'trigger': True} if order.type == 'stop_market' else None
         try:
-            raw = await self.ex[order.venue].ux_cancel_order(order.venue_order_id, order.symbol)
+            raw = await self.ex[order.venue].ux_cancel_order(order.venue_order_id, order.symbol,
+                                                             params=params)
         except UXError as err:
             if err.klass is ErrorClass.REJECTED:     # OrderNotFound: already gone
                 return order.model_copy(update={'state': OrderState.CANCELED})

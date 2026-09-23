@@ -23,7 +23,7 @@ from typing import Any
 from ..bus import Bus
 from ..clock import Clock, LiveClock
 from ..data.resample import Resampler
-from ..events import PortfolioSnapshot, StaleFeed, intent_subject
+from ..events import STRATEGY_STATUS, PortfolioSnapshot, StaleFeed, StrategyStatus, intent_subject
 from ..strategy import StrategyBase, StrategyContext
 from ..types import Bar, BookSnapshot, Fill, Funding, Intent, TradeTick
 
@@ -57,6 +57,10 @@ class _Hosted:
     resampler: Resampler | None
     module_file: str | None
     module_mtime: float
+    bars_seen: int = 0
+    last_reason: str | None = None
+    last_intent_at: Any = None
+    last_status_at: float = 0.0
 
 
 class StrategyEngine:
@@ -105,8 +109,30 @@ class StrategyEngine:
             resampler=Resampler(cls.timeframe) if cls.timeframe != '1m' else None,
             module_file=module_file,
             module_mtime=os.path.getmtime(module_file) if module_file else 0.0)
+        if prev is not None:                    # a reload keeps the warm-up count
+            self.hosted[name].bars_seen = prev.bars_seen
         log.info('strategy_hosted name=%s stage=%s budget=%.4f symbols=%s',
                  name, spec.stage, budget, list(strategy.symbols))
+        await self.publish_status(self.hosted[name], force=True)
+
+    def status(self, h: _Hosted) -> StrategyStatus:
+        cls = type(h.strategy)
+        doc = (inspect.getdoc(cls.__mro__[1]) or '').split('\n\n')[0].replace('\n', ' ')
+        return StrategyStatus(
+            name=h.ctx.strategy, cls=cls.__mro__[1].__name__, description=doc[:280],
+            timeframe=h.strategy.timeframe, symbols=tuple(h.strategy.symbols),
+            stage=h.spec.stage, risk_budget=h.ctx.risk_budget, bars_seen=h.bars_seen,
+            warmup_bars=h.strategy.warmup_bars, last_reason=h.last_reason,
+            last_intent_at=h.last_intent_at)
+
+    async def publish_status(self, h: _Hosted, *, force: bool = False) -> None:
+        """Throttled to one per strategy per second — the UI does not need every bar."""
+        import time
+        now = time.monotonic()
+        if not force and now - h.last_status_at < 1.0:
+            return
+        h.last_status_at = now
+        await self.bus.publish(STRATEGY_STATUS, self.status(h))
 
     async def warmup(self, bars: Iterable[Bar]) -> int:
         """Replay history through every strategy with intents discarded."""
@@ -162,10 +188,14 @@ class StrategyEngine:
                 continue
             h.ctx._marks[bar.symbol] = bar.close                 # noqa: SLF001
             if bar.timeframe == h.strategy.timeframe:
+                h.bars_seen += 1
                 await self._emit(h, await h.strategy.on_bar(bar))
             elif h.resampler is not None and bar.timeframe == '1m':
                 for agg in h.resampler.push(bar):
+                    h.bars_seen += 1
                     await self._emit(h, await h.strategy.on_bar(agg))
+            if not self.warming:
+                await self.publish_status(h)
 
     async def _emit(self, h: _Hosted, intents: list[Intent]) -> None:
         if self.warming or not intents:
@@ -173,8 +203,11 @@ class StrategyEngine:
         for intent in intents:
             if intent.strategy != h.ctx.strategy:
                 intent = intent.model_copy(update={'strategy': h.ctx.strategy})
+            h.last_reason = intent.reason
+            h.last_intent_at = intent.created_at
             await self.bus.publish(intent_subject(h.ctx.strategy), intent)
             self.intents_published += 1
+        await self.publish_status(h, force=True)
 
     async def _on_snapshot(self, _subject: str, snap) -> None:
         if not isinstance(snap, PortfolioSnapshot):

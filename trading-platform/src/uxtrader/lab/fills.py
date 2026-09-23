@@ -136,19 +136,24 @@ class FillSimulator:
 
 
 def synthetic_book(mid: Decimal, spread_bps: float = 2.0, depth: int = 10,
-                   size_per_level: Decimal = Decimal('5'),
+                   size_per_level: Decimal | None = None,
                    venue: str = 'sim', symbol: str = 'BTC/USDT:USDT',
-                   ts=None) -> BookSnapshot:
+                   ts=None, notional_per_level: Decimal = Decimal('250000')) -> BookSnapshot:
     """A book for tests and for bar-only backtests where L2 is unavailable.
+
+    Depth is set in NOTIONAL per level ($250k by default), not base units. A fixed
+    base-unit size makes the same book deep for BTC and absurdly thin for a $500 asset,
+    which silently turns large orders into partial fills.
 
     Using this in a backtest means your slippage numbers are assumptions, not
     measurements. Say so in the report.
     """
     from ..types import utcnow
+    size = size_per_level if size_per_level is not None else notional_per_level / mid
     half = mid * Decimal(str(spread_bps / 2 / 1e4))
     bids = tuple(BookLevel(price=mid - half - mid * Decimal(str(i * 0.0001)),
-                           size=size_per_level) for i in range(depth))
+                           size=size) for i in range(depth))
     asks = tuple(BookLevel(price=mid + half + mid * Decimal(str(i * 0.0001)),
-                           size=size_per_level) for i in range(depth))
+                           size=size) for i in range(depth))
     return BookSnapshot(venue=venue, symbol=symbol, ts=ts or utcnow(),
                         bids=bids, asks=asks)

@@ -1,8 +1,9 @@
 # Roadmap — v0.1 to Production
 
-> **Where the code is now:** Phases 0, 2 and 4 are built and their gates pass offline;
-> Phase 1 is built except persistence; Phase 5's tooling (services, alerts, metrics,
-> dashboard) is built, but the 30 days of paper trading it requires have not started.
+> **Where the code is now:** Phases 0, 2 and 4 are built and their gates pass offline
+> (L3 venue stops included); Phase 1 is built with SQLite/Parquet persistence; Phase 5's
+> tooling (launcher, dashboard, services on real NATS, alerts, metrics) is built, but the
+> 30 days of paper trading it requires have not started.
 > No strategy has passed Phase 3's real-data validation. The one blocker that cannot be
 > solved in code is running `uxtrader.data.history` somewhere that can reach the venues.
 > Per-component detail: `docs/02-architecture.md §9`.
@@ -56,7 +57,7 @@ guard catches it.
 gate, it does not proceed — and you will have learned more from that than from a pass.**
 
 ## Phase 4 — Risk and execution (weeks 10 – 12)
-**Status: built.** Kill → flatten → rearm, daily-loss halt, stale-feed blocking and per-strategy books are tested end to end. **Still open:** L3 venue-native stops; algos not wired into the OMS.
+**Status: built.** Kill → flatten → rearm, daily-loss halt, stale-feed blocking, per-strategy books and L3 venue-native stops are tested end to end. **Still open:** algos not wired into the OMS.
 
 - `risk.py`: the full check ladder, drawdown ladder, kill switch L1.
 - `portfolio.py`: position truth, PnL attribution, reconciliation loop.

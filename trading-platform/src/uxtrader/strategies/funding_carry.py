@@ -35,6 +35,9 @@ class FundingCarry(StrategyBase):
     MAX_ASSET_FRACTION = 0.15      # of sleeve equity
     MAX_OI_FRACTION = 0.02         # never more than 2% of open interest
     MAX_ADV_FRACTION = 0.05
+    # Where the long spot hedge is bought. Without it S1 would be a naked perp short,
+    # so it refuses to enter at all until this is configured (params: spot_venue).
+    SPOT_VENUE: str | None = None
 
     def __init__(self, ctx: StrategyContext) -> None:
         super().__init__(ctx)
@@ -78,10 +81,29 @@ class FundingCarry(StrategyBase):
         mark = float(bar.close)
 
         if position != 0:
-            return self._manage(s, mark)
-        return self._maybe_enter(s, mark)
+            return self._hedged(self._manage(s, mark))
+        return self._hedged(self._maybe_enter(s, mark))
+
+    def _hedged(self, intents: list[Intent]) -> list[Intent]:
+        """Every perp intent gets its mirror on the spot leg: same size, opposite sign,
+        on SPOT_VENUE. The two legs are what make this carry rather than a directional
+        short; they are always emitted together."""
+        out: list[Intent] = []
+        for i in intents:
+            out.append(i)
+            spot = i.symbol.split(':')[0]
+            out.append(self.target(spot, -i.target.position, venue=self.SPOT_VENUE,
+                                   reason=f'hedge leg: {i.reason}', algo=i.algo,
+                                   urgency=i.urgency))
+        return out
 
     def _maybe_enter(self, s: str, mark: float) -> list[Intent]:
+        if not self.SPOT_VENUE:
+            if not getattr(self, '_warned_unhedged', False):
+                self._warned_unhedged = True
+                log.error('s1_disabled: no spot_venue configured — refusing to open an '
+                          'unhedged perp short')
+            return []
         apr = self._apr.get(s, 0.0)
         basis = self._basis_bps.get(s, 0.0)
         rates = self._recent_rates.get(s, [])
@@ -103,8 +125,7 @@ class FundingCarry(StrategyBase):
             return []
 
         qty = Decimal(str(notional / mark))
-        # Short the perp. The long spot leg is placed by the engine's hedge handler as
-        # a paired intent on the spot symbol; both legs are sized from this number.
+        # Short the perp; _hedged() adds the equal long spot leg.
         return [self.target(
             s, -qty,
             reason=f'carry apr={apr:.1%} basis={basis:.1f}bps notional={notional:,.0f}',

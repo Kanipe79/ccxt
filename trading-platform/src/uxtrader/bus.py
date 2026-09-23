@@ -72,6 +72,9 @@ class InMemoryBus:
     async def subscribe(self, pattern: str, handler: Handler) -> None:
         self._subs.append((pattern, handler))
 
+    async def unsubscribe(self, pattern: str, handler: Handler) -> None:
+        self._subs = [(p, h) for p, h in self._subs if not (p == pattern and h is handler)]
+
     async def close(self) -> None:
         self._subs.clear()
 
@@ -83,13 +86,18 @@ class NatsBus:
     """NATS JetStream transport. At-least-once delivery: handlers must be idempotent,
     which target-position intents and deterministic client order ids make them."""
 
-    def __init__(self, url: str = 'nats://localhost:4222', *,
-                 stream: str = 'UX', subjects: tuple[str, ...] = (
-                     'md.>', 'intent.>', 'exec.>', 'risk.>', 'fill.>', 'feed.>',
-                     'heartbeat.>')) -> None:
+    # Durable, state-changing traffic: persisted in JetStream and replayable.
+    DURABLE = ('intent.>', 'exec.>', 'risk.veto', 'fill.>', 'feed.>', 'control.>')
+    # High-rate broadcasts where only the latest value matters: core NATS.
+    EPHEMERAL = ('md.', 'heartbeat.', 'portfolio.', 'strategy.', 'risk.status')
+
+    def __init__(self, url: str = 'nats://localhost:4222', *, service: str = 'ux',
+                 stream: str = 'UX', subjects: tuple[str, ...] = DURABLE) -> None:
         self.url = url
+        self.service = service
         self.stream = stream
         self.subjects = subjects
+        self._n_subs = 0
         self._nc = None
         self._js = None
         self._subs: list[object] = []
@@ -108,9 +116,9 @@ class NatsBus:
         if self._js is None:
             raise RuntimeError('NatsBus.connect() was not awaited')
         data = Envelope.wrap(subject, msg).model_dump_json().encode()
-        # Market data is high-volume and replaceable: core NATS. Everything else is
-        # state-changing and goes through JetStream for persistence and replay.
-        if subject.startswith('md.') or subject.startswith('heartbeat.'):
+        # A JetStream publish to a subject no stream covers fails outright, so the
+        # split must be exhaustive: anything not ephemeral must match DURABLE.
+        if self._ephemeral(subject):
             await self._nc.publish(subject, data)          # type: ignore[union-attr]
         else:
             await self._js.publish(subject, data)
@@ -128,24 +136,64 @@ class NatsBus:
                 # JetStream has already persisted it for post-mortem replay.
                 log.exception('handler_failed subject=%s', raw.subject)
 
-        if pattern.startswith('md.') or pattern.startswith('heartbeat.'):
+        if self._ephemeral(pattern):
             sub = await self._nc.subscribe(pattern, cb=_cb)
         else:
-            durable = pattern.replace('.', '_').replace('*', 'S').replace('>', 'R')
-            sub = await self._js.subscribe(pattern, cb=_cb, durable=durable,
-                                           manual_ack=False)
+            from nats.js.api import ConsumerConfig, DeliverPolicy
+            # One durable consumer PER SUBSCRIPTION. Durables are shared by name, so a
+            # name derived from the pattern alone would make the portfolio service and
+            # the strategy engine (both on fill.>) split each other's fills.
+            # The index is stable across restarts because services subscribe in a
+            # fixed order, so a restarted service resumes its own consumer.
+            self._n_subs += 1
+            token = pattern.replace('.', '_').replace('*', 'S').replace('>', 'R')
+            durable = f'{self.service}_{self._n_subs}_{token}'
+            # DeliverPolicy.NEW: a brand-new consumer must not replay the stream's
+            # history — replaying old exec.order messages would re-execute old trades.
+            sub = await self._js.subscribe(
+                pattern, cb=_cb, durable=durable, manual_ack=False,
+                config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW))
         self._subs.append(sub)
+
+    @classmethod
+    def _ephemeral(cls, subject: str) -> bool:
+        return subject.startswith(cls.EPHEMERAL)
 
     async def close(self) -> None:
         if self._nc is not None:
             await self._nc.drain()
 
 
-async def connect(url: str | None) -> Bus:
+async def connect(url: str | None, service: str = 'ux') -> Bus:
     """``None`` or 'memory://' → InMemoryBus; 'nats://…' → NatsBus."""
     if not url or url.startswith('memory://'):
         return InMemoryBus()
-    return await NatsBus(url).connect()
+    return await NatsBus(url, service=service).connect()
 
 
 __all__ = ['Bus', 'Handler', 'InMemoryBus', 'NatsBus', 'connect', 'subject_matches']
+
+
+class ScopedBus:
+    """A view of a bus whose subscriptions can all be removed at once.
+
+    The launcher starts and stops the whole trading platform many times inside one
+    long-lived process (the one serving the dashboard). Each run gets a ScopedBus, so
+    stopping a run leaves no orphaned handlers on the shared bus.
+    """
+
+    def __init__(self, bus: InMemoryBus) -> None:
+        self.bus = bus
+        self._mine: list[tuple[str, Handler]] = []
+
+    async def publish(self, subject: str, msg: BaseModel) -> None:
+        await self.bus.publish(subject, msg)
+
+    async def subscribe(self, pattern: str, handler: Handler) -> None:
+        self._mine.append((pattern, handler))
+        await self.bus.subscribe(pattern, handler)
+
+    async def close(self) -> None:
+        for pattern, handler in self._mine:
+            await self.bus.unsubscribe(pattern, handler)
+        self._mine.clear()

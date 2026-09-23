@@ -144,7 +144,7 @@ async def main(argv: list[str] | None = None) -> int:
             await ex.setup()
             exchanges[venue] = ex
 
-    bus = await connect(bus_url)
+    bus = await connect(bus_url, service=args.role)
     keep = await build(cfg, args.role, bus, exchanges)
     hb = asyncio.create_task(heartbeat_loop(bus, f'{args.role}'))
     log.warning('running role=%s mode=%s bus=%s components=%d',

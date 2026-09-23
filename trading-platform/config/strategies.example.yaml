@@ -3,11 +3,13 @@
 strategies:
   - id: S1
     class: uxtrader.strategies.FundingCarry
-    enabled: true
+    # Needs a spot venue for the hedge leg (params.spot_venue) AND that venue enabled
+    # in config.yaml. Without it S1 refuses to trade rather than run a naked short.
+    enabled: false
     risk_budget: 0.35
     stage: 1                # staged rollout: 1=10% size, 2=25%, 3=50%, 4=100%
     symbols: [BTC/USDT:USDT, ETH/USDT:USDT, SOL/USDT:USDT]
-    params: { min_apr: 0.12, exit_apr: 0.03, min_liq_distance: 0.35 }
+    params: { min_apr: 0.12, exit_apr: 0.03, min_liq_distance: 0.35, spot_venue: binance }
 
   - id: S2
     class: uxtrader.strategies.CrossSectionalMomentum

@@ -70,28 +70,32 @@ class VectorBacktester:
     def __init__(self, *, starting_equity: float = 100_000.0,
                  risk: RiskEngine | None = None,
                  simulator: FillSimulator | None = None,
-                 spread_bps: float = 2.0, level_size: float = 5.0,
-                 level_step_bps: float = 1.0) -> None:
+                 spread_bps: float = 2.0, level_notional: float = 250_000.0,
+                 level_step_bps: float = 1.0, depth: int = 10) -> None:
         self.starting_equity = starting_equity
         self.risk = risk or RiskEngine()
         self.sim = simulator or FillSimulator()
         # Must match fills.synthetic_book's defaults for the cross-check to hold.
         self.half_spread = spread_bps / 2 / 1e4
-        self.level_size = level_size
+        self.level_notional = level_notional
         self.level_step = level_step_bps / 1e4
+        self.depth = depth
 
-    def _walk(self, mid: float, qty: float, buy: bool) -> float:
-        """Average price walking the synthetic ladder — same shape as synthetic_book."""
+    def _walk(self, mid: float, qty: float, buy: bool) -> tuple[float, float]:
+        """(filled, avg price) walking the synthetic ladder — same shape as
+        synthetic_book. A market order larger than the book fills PARTIALLY, exactly
+        as FillSimulator.fill_market does; the remainder is not filled."""
+        level_size = self.level_notional / mid
         remaining, cost, i = qty, 0.0, 0
         sign = 1.0 if buy else -1.0
-        while remaining > 1e-15 and i < 10:
+        while remaining > 1e-15 and i < self.depth:
             px = mid * (1 + sign * (self.half_spread + i * self.level_step))
-            take = min(remaining, self.level_size)
+            take = min(remaining, level_size)
             cost += take * px
             remaining -= take
             i += 1
         filled = qty - max(remaining, 0.0)
-        return cost / filled if filled > 0 else mid
+        return filled, (cost / filled if filled > 0 else mid)
 
     def run(self, bars: pd.DataFrame, decide: Decide, *, symbol: str = 'SIM',
             venue: str = 'sim', strategy: str = 'vector', timeframe_hours: float = 4.0
@@ -147,12 +151,15 @@ class VectorBacktester:
                         continue
                     if self.sim.rng.random() < self.sim.costs.reject_rate:
                         continue                        # venue reject, as in FillSimulator
-                    avg = self._walk(o[t], abs(delta), delta > 0)
-                    fee = avg * abs(delta) * taker
+                    filled, avg = self._walk(o[t], abs(delta), delta > 0)
+                    if filled <= 0:
+                        continue
+                    signed = filled if delta > 0 else -filled
+                    fee = avg * filled * taker
                     ref = mark if mark is not None else o[t]
-                    equity -= delta * (avg - ref) + fee
-                    pos += delta
-                    out.fills.append((t, delta, avg, fee))
+                    equity -= signed * (avg - ref) + fee
+                    pos += signed
+                    out.fills.append((t, signed, avg, fee))
                 pending = []
 
             # 2. strategy decides on this bar's close

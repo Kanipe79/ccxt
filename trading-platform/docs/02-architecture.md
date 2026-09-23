@@ -287,7 +287,7 @@ better, it does not belong on this platform.
 | Backtest compute | numpy/pandas + plain Python loops | Measured: the event engine runs ~20k bars/s, and the vectorized engine is ~2x faster than that (§3.4). Polars is worth adding for S2's cross-sectional ranking over 40+ symbols; profile first. |
 | Optimization | **Optuna** (TPE + Hyperband pruning) | Better than grid search at the sample sizes here, and the pruner kills bad trials early. |
 | API | **FastAPI + Pydantic v2** | Schema validation on every boundary; Pydantic models double as the message contracts on NATS. |
-| Dashboard | **Implemented:** a single self-contained page served by FastAPI (no build step, no CDN), with WS push. **Planned:** React + TypeScript + lightweight-charts once candle charts and analytics justify a build pipeline. | A trading dashboard's first job is to be available when everything else is on fire. One static file with no third-party scripts has the fewest ways to fail. |
+| Dashboard | **Implemented:** a vanilla-JS single-page app with hand-drawn SVG charts (equity, candles with fills, meters), served by FastAPI with WS push. No build step, no CDN, no third-party scripts. | A trading dashboard's first job is to be available when everything else is on fire. One static file with no third-party scripts has the fewest ways to fail. |
 | Containers | **Docker + Kubernetes** (or Nomad for 1 – 3 nodes) | K8s is genuinely overkill under 5 services; start with `docker compose` and migrate when you have more than one node. Manifests provided either way. |
 | Secrets | **HashiCorp Vault** or **SOPS + age** | API keys never in env vars in a repo, never in the image. Separate keys per environment, IP-allowlisted, withdrawal permission **off**. |
 | Monitoring | **Prometheus + Grafana + Loki + Alertmanager** | Standard, free, and every library you use already exports to it. |
@@ -411,17 +411,17 @@ covered by tests (`pytest tests`) and runs offline.
 | `uxcore` taxonomy, limiter, retry, reconcile, breaker | **Done** | Verified against the fork's own ccxt `binanceusdm` (HTTP stubbed): forced 429, forced timeout, lost-then-found orders, unreachable reconciliation |
 | Event-driven backtester | **Done** | Next-bar-open fills, real UTC day/week baselines, risk flattens |
 | Vectorized backtester (S4) | **Done** | Identical results to the event engine; ~2x faster |
-| Risk engine | **Done** except VaR | `var_99_1d` is an input nobody computes yet; the check is inert until the EWMA covariance job exists |
+| Risk engine | **Done** | VaR is conservative: EWMA vol per underlying on market time, spot netted against perp, correlation 1 across assets (an upper bound) |
 | Per-strategy books | **Done** | Portfolio, risk, OMS, services |
-| Services over the bus | **Done** | Portfolio, risk, execution, strategy engine; InMemoryBus tested end to end; NatsBus written but **not run against a NATS server here** |
+| Services over the bus | **Done** | In-memory and **real NATS** (tests start nats-server). NATS testing found three bugs: portfolio/control subjects in no stream, services sharing a durable consumer and splitting messages, and new consumers replaying old orders |
 | Historical loader, Parquet store, resampler | **Done** | Tested through real ccxt parsing |
 | WS ingestion | **Done** | Tested against a scripted ccxt.pro-shaped exchange, not a live socket |
 | Paper broker | **Done** | Market orders walk the book; limit orders need trade prints |
 | Live broker | **Done, untested live** | Rounding, flags, rejections, user-stream fills tested offline |
 | L1 kill (risk) + operator kill → L2 watchdog | **Done** | Dashboard/API kill reaches both |
-| L3 venue-native stops | **Planned** | `StopSpec.venue_native` is carried on intents; nothing places the stop yet |
+| L3 venue-native stops | **Done** | `services/stops.py`: one stop per protected book, wider than the software stop, trails with the strategy, reduce-only only when the net position allows |
 | Execution algos (PostOnlyPeg, TWAP, POV) in the OMS | **Planned** | Classes exist; not wired |
 | Smart order routing | **Planned** | `SmartRouter` exists; single default venue today |
-| Alerts, Prometheus metrics, dashboard, API | **Done** | Dashboard verified in Chromium at desktop and phone widths |
-| ClickHouse / Postgres persistence | **Planned** | Research data is Parquet; service state is in memory and rebuilt from venues on start |
+| Alerts, metrics, dashboard, API, launcher | **Done** | `ux` / `./start.sh`; the dashboard starts and stops demo/paper/live runs; verified in Chromium (light + dark, 1440 px + 390 px) |
+| Persistence | **Partial** | SQLite journal (equity, fills, events) for single-box use; research data is Parquet; ClickHouse/Postgres are still planned |
 | Real-data validation (G1–G6) of any strategy | **Not started** | The development environment could not reach exchange APIs |

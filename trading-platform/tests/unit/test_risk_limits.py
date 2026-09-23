@@ -181,3 +181,31 @@ def test_strategy_exit_uses_its_own_book_not_the_net():
     state = make_state(positions=[book('s1', '-0.3'), book('s4', '0.3')])
     decision = engine.evaluate(make_intent(position='0', strategy='s4'), state)
     assert decision.approved and decision.adjusted_position == 0
+
+
+def test_stop_only_update_passes_even_when_killed():
+    engine = RiskEngine()
+    engine.kill.fire('test')
+    decision = engine.evaluate(make_intent(position='0.3'), make_state(positions=held('0.3')))
+    assert decision.approved and decision.note == 'stop update'
+
+
+def test_var_nets_spot_against_perp_and_uses_market_time():
+    from datetime import timedelta
+
+    from uxtrader.risk import VarModel
+    m = VarModel(min_samples=5)
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    px = 50000.0
+    for i in range(200):                       # ±1% per 4h bar ≈ 2.45% daily vol
+        px *= 1.01 if i % 2 else 0.99
+        m.update('BTC/USDT:USDT', px, t0 + timedelta(hours=4 * i))
+    assert 0.02 < m.daily_vol('BTC/USDT') < 0.03, 'spot must share the perp vol'
+    marks = {'BTC/USDT:USDT': Decimal('50000'), 'BTC/USDT': Decimal('50000')}
+    hedged = [Position(venue='v', symbol='BTC/USDT:USDT', strategy='s1', quantity=Decimal('-1')),
+              Position(venue='v', symbol='BTC/USDT', strategy='s1', quantity=Decimal('1'))]
+    assert m.var_99(hedged, marks, Decimal('100000')) == 0.0
+    naked = hedged[:1]
+    assert m.var_99(naked, marks, Decimal('100000')) > 0.02
+    # An asset with no history uses the pessimistic 100%-annualised prior.
+    assert m.daily_vol('NEW/USDT') > 0.05
