@@ -319,7 +319,7 @@ trading-platform/
 │   │   ├── plugin_registry.py       # plugin registry
 │   │   └── plugins/binance_pm.py    # portfolio-margin endpoints (others planned)
 │   └── uxtrader/
-│       ├── types.py  events.py  bus.py  clock.py  config.py
+│       ├── types.py  events.py  bus.py  clock.py  settings.py
 │       ├── strategy.py              # StrategyBase, StrategyContext
 │       ├── portfolio.py             # per-(venue, symbol, strategy) books, attribution
 │       ├── risk.py                  # pre-trade gate, drawdown ladder, kill switch

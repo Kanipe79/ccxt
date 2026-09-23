@@ -20,7 +20,7 @@ import logging
 import sys
 from typing import Any
 
-from . import config as config_mod
+from . import settings as config_mod
 from .bus import Bus, connect
 from .clock import LiveClock
 from .risk import RiskEngine

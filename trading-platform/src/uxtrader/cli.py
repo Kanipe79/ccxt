@@ -101,7 +101,7 @@ def _doctor(args) -> int:
             check(f'{mod}', True)
         except ImportError:
             check(f'{mod}', False, 'pip install -e .')
-    from .config import credentials
+    from .settings import credentials
     for venue in ('binanceusdm', 'bybit', 'okx'):
         has = bool(credentials(venue))
         check(f'{venue} keys', has, 'present (only needed for live)' if has

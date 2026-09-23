@@ -11,4 +11,4 @@ config/secrets*.yaml
 !config/secrets.enc.yaml
 keys.local.json
 .venv/
-data/
+/data/

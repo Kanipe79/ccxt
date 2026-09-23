@@ -210,7 +210,7 @@ class Supervisor:
                 'time_scale': round(60 / clock.speed) if isinstance(clock, MarketClock) else 1}
 
     def catalog(self) -> dict[str, Any]:
-        from .config import credentials
+        from .settings import credentials
         strategies = [{
             'id': 'DEMO', 'name': 'Demo crossover', 'class': 'DemoCrossover', 'tag': 'Demo',
             'description': 'An EMA crossover on 1-minute bars so the dashboard comes alive within '
@@ -262,7 +262,7 @@ class Supervisor:
         if total > 1.0 + 1e-9:
             raise ValueError(f'risk budgets sum to {total:.0%}; the maximum is 100%')
         if req.mode == 'live':
-            from .config import credentials
+            from .settings import credentials
             if req.confirm != 'LIVE':
                 raise ValueError('live mode places real orders: type LIVE to confirm')
             if not credentials(req.venue):
@@ -309,7 +309,7 @@ class Supervisor:
         symbols = tuple(sorted({sym for sp in specs for sym in sp.symbols}))
 
         if req.mode == 'live':
-            from .config import credentials
+            from .settings import credentials
             from .execution.live import LiveBroker
             ex = await self._exchange(req.venue, credentials(req.venue))
             broker: Any = LiveBroker({req.venue: ex}, clock=clock)
