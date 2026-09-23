@@ -76,33 +76,54 @@ class UXError(Exception):
 
 
 def _ccxt_mapping() -> list[tuple[type, ErrorClass]]:
-    """Ordered most-specific-first; the first isinstance match wins."""
+    """Ordered most-specific-first; the first isinstance match wins.
+
+    Order matters because CCXT's hierarchy nests: ``RateLimitExceeded``,
+    ``InvalidNonce`` and ``OnMaintenance`` are all ``NetworkError`` subclasses, and
+    ``PermissionDenied``/``AccountSuspended`` are ``AuthenticationError`` subclasses.
+    """
     if ccxt is None:
         return []
     return [
         # Fatal — a human must look at this.
         (ccxt.AuthenticationError,   ErrorClass.FATAL),
-        (ccxt.PermissionDenied,      ErrorClass.FATAL),
-        (ccxt.AccountSuspended,      ErrorClass.FATAL),
         (ccxt.BadSymbol,             ErrorClass.FATAL),
         (ccxt.NotSupported,          ErrorClass.FATAL),
-        # Ambiguous — the request may have landed. Reconcile.
-        (ccxt.RequestTimeout,        ErrorClass.AMBIGUOUS),
-        (ccxt.InvalidNonce,          ErrorClass.AMBIGUOUS),
-        # Rate limited.
+        # Rate limited — the venue refused before processing. Never ambiguous.
         (ccxt.RateLimitExceeded,     ErrorClass.RATE_LIMITED),
         (ccxt.DDoSProtection,        ErrorClass.RATE_LIMITED),
+        # The venue refused before processing (clock skew / recvWindow). A retry with
+        # a fresh timestamp is safe, so this is transient — NOT ambiguous.
+        (ccxt.InvalidNonce,          ErrorClass.TRANSIENT),
+        (ccxt.OnMaintenance,         ErrorClass.TRANSIENT),
         # Rejected — venue understood and declined. Retrying changes nothing.
         (ccxt.InsufficientFunds,     ErrorClass.REJECTED),
         (ccxt.InvalidOrder,          ErrorClass.REJECTED),
-        (ccxt.OrderNotFound,         ErrorClass.REJECTED),
         (ccxt.BadRequest,            ErrorClass.REJECTED),
-        # Transient — retry.
-        (ccxt.OnMaintenance,         ErrorClass.TRANSIENT),
+        # No usable response: we cannot know whether a mutating request landed.
+        # These are the only classes promoted to AMBIGUOUS when was_sent=True.
+        (ccxt.RequestTimeout,        ErrorClass.TRANSIENT),
         (ccxt.ExchangeNotAvailable,  ErrorClass.TRANSIENT),
         (ccxt.NetworkError,          ErrorClass.TRANSIENT),
+        # The venue answered with an error we have no specific mapping for. It
+        # answered, so the outcome is known: retry reads, do not retry writes.
         (ccxt.ExchangeError,         ErrorClass.TRANSIENT),
     ]
+
+
+def _no_response_types() -> tuple[type, ...]:
+    """Exceptions that mean *no usable response arrived* — the ambiguous family."""
+    if ccxt is None:
+        return ()
+    return (ccxt.RequestTimeout, ccxt.ExchangeNotAvailable, ccxt.NetworkError)
+
+
+def _refused_types() -> tuple[type, ...]:
+    """NetworkError subclasses where the venue demonstrably refused the request."""
+    if ccxt is None:
+        return ()
+    return (ccxt.RateLimitExceeded, ccxt.DDoSProtection, ccxt.InvalidNonce,
+            ccxt.OnMaintenance)
 
 
 def classify(exc: BaseException, *, venue: str = '',
@@ -110,18 +131,33 @@ def classify(exc: BaseException, *, venue: str = '',
              was_sent: bool = False) -> UXError:
     """Map any exception onto the taxonomy.
 
-    ``was_sent`` promotes an otherwise-transient network error to AMBIGUOUS when the
-    request body has already gone out on the wire. Callers that mutate state (create,
-    cancel, edit) must pass ``was_sent=True``; read-only callers must not.
+    ``was_sent`` must be True for calls that mutate venue state (create, edit) and
+    False for reads. It changes two outcomes:
+
+    * a *no-response* failure (timeout, dropped connection, 502/504) on a mutating
+      call becomes AMBIGUOUS — the order may exist, so the caller must reconcile;
+    * a generic ``ExchangeError`` on a mutating call becomes REJECTED — the venue
+      answered, so blindly re-sending risks a duplicate for no benefit.
+
+    Reads are never AMBIGUOUS: re-reading has no side effects.
     """
     if isinstance(exc, UXError):
         return exc
-    for exc_type, klass in _ccxt_mapping():
+    klass: ErrorClass | None = None
+    for exc_type, mapped in _ccxt_mapping():
         if isinstance(exc, exc_type):
-            if was_sent and klass is ErrorClass.TRANSIENT:
-                klass = ErrorClass.AMBIGUOUS
-            return UXError(str(exc), klass, venue=venue, original=exc,
-                           client_order_id=client_order_id)
-    klass = ErrorClass.AMBIGUOUS if was_sent else ErrorClass.TRANSIENT
-    return UXError(str(exc), klass, venue=venue, original=exc,
+            klass = mapped
+            break
+
+    if was_sent and not isinstance(exc, _refused_types()):
+        if klass is None or isinstance(exc, _no_response_types()):
+            # Unknown exception types (asyncio.TimeoutError, aiohttp errors, OSError)
+            # are treated as no-response too: assume the worst.
+            klass = ErrorClass.AMBIGUOUS
+        elif klass is ErrorClass.TRANSIENT:
+            klass = ErrorClass.REJECTED
+    elif klass is None:
+        klass = ErrorClass.TRANSIENT
+
+    return UXError(str(exc) or type(exc).__name__, klass, venue=venue, original=exc,
                    client_order_id=client_order_id)

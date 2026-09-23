@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from .types import Intent, LimitBreach, Position, RiskDecision
@@ -57,7 +57,7 @@ class RiskState:
     consecutive_losses: dict[str, int] = field(default_factory=dict)
     orders_this_min: dict[str, int] = field(default_factory=dict)
     var_99_1d: float = 0.0
-    today: date | None = None
+    now: datetime | None = None         # required for the daily halt to expire
 
     @property
     def drawdown(self) -> float:
@@ -76,6 +76,17 @@ class RiskState:
         if self.week_start_equity <= 0:
             return 0.0
         return float((self.equity - self.week_start_equity) / self.week_start_equity)
+
+
+def is_reducing(have: Decimal, target: Decimal) -> bool:
+    """True when moving from `have` to `target` strictly lowers exposure without
+    crossing through flat. A flip (long 10 → short 5) is NOT reducing: it opens a new
+    position and must pass every check an entry would."""
+    if have == 0:
+        return False
+    if target == 0:
+        return True
+    return (target > 0) == (have > 0) and abs(target) < abs(have)
 
 
 class KillSwitch:
@@ -129,29 +140,88 @@ class RiskEngine:
                  kill: KillSwitch | None = None) -> None:
         self.limits = limits or RiskLimits()
         self.kill = kill or KillSwitch()
+        self.entries_halted_until: datetime | None = None
+        self._flatten_reason: str | None = None
 
-    # -- the ladder ------------------------------------------------------------
+    # -- portfolio-level limits --------------------------------------------------
+
+    def check_limits(self, state: RiskState) -> str | None:
+        """The drawdown ladder. Called on every mark AND before every entry, so a
+        breach flattens the book even when no strategy is trying to trade.
+
+        Returns the reason entries are blocked, or None. Side effects are
+        deliberate and ordered by severity:
+          * peak-to-trough ≥ dd_stop_at → global kill (manual re-arm) + flatten
+          * weekly loss                  → global kill (manual re-arm) + flatten
+          * daily loss                   → halt entries until 00:00 UTC + flatten
+        """
+        L = self.limits
+        dd = state.drawdown
+        if dd >= L.dd_stop_at:
+            if self.kill.global_armed:
+                self.kill.fire(f'drawdown {dd:.1%} >= {L.dd_stop_at:.1%}')
+                self._flatten_reason = 'drawdown stop'
+            return 'drawdown_stop'
+        if state.weekly_pnl_pct <= -L.max_weekly_loss:
+            if self.kill.global_armed:
+                self.kill.fire(f'weekly loss {state.weekly_pnl_pct:.2%}')
+                self._flatten_reason = 'weekly loss limit'
+            return 'weekly_loss'
+        if state.daily_pnl_pct <= -L.max_daily_loss and not self._halted(state.now):
+            now = state.now or datetime.now(timezone.utc)
+            self.entries_halted_until = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            self._flatten_reason = 'daily loss limit'
+            log.critical('daily_loss_halt pnl=%.2f%% until=%s',
+                         state.daily_pnl_pct * 100, self.entries_halted_until)
+        if self._halted(state.now):
+            return 'daily_loss'
+        return None
+
+    def take_flatten_request(self) -> str | None:
+        """The engine calls this after each mark; a non-None reason means: emit a
+        flattening intent for every open position now. Consumed exactly once."""
+        reason, self._flatten_reason = self._flatten_reason, None
+        return reason
+
+    def _halted(self, now: datetime | None) -> bool:
+        if self.entries_halted_until is None:
+            return False
+        if now is not None and now >= self.entries_halted_until:
+            self.entries_halted_until = None
+            return False
+        return True
+
+    # -- the per-intent ladder ---------------------------------------------------
 
     def evaluate(self, intent: Intent, state: RiskState) -> RiskDecision:
         breaches: list[LimitBreach] = []
         L = self.limits
+        current = state.positions.get(intent.symbol)
+        have = current.quantity if current else Decimal('0')
+        target = intent.target.position
+
+        # 0. De-risking is ALWAYS permitted — through a fired kill switch, a drawdown
+        # stop, a stale feed, anything. A risk engine that can veto a stop-loss exit
+        # is a risk engine that can hold a losing position open indefinitely.
+        if is_reducing(have, target):
+            return RiskDecision(intent_id=intent.intent_id, approved=True,
+                                adjusted_position=target, note='risk-reducing')
 
         # 1. kill switch — cheapest check first
         blocked = self.kill.blocked(intent.strategy, intent.venue)
         if blocked:
             return self._veto(intent, 'kill_switch', 1.0, 0.0, note=blocked)
 
-        # 2. drawdown ladder
-        dd = state.drawdown
-        if dd >= L.dd_stop_at:
-            self.kill.fire(f'drawdown {dd:.1%} >= {L.dd_stop_at:.1%}')
-            return self._veto(intent, 'drawdown_stop', dd, L.dd_stop_at)
-        if state.daily_pnl_pct <= -L.max_daily_loss:
-            self.kill.fire(f'daily loss {state.daily_pnl_pct:.2%}')
-            return self._veto(intent, 'daily_loss', abs(state.daily_pnl_pct), L.max_daily_loss)
-        if state.weekly_pnl_pct <= -L.max_weekly_loss:
-            self.kill.fire(f'weekly loss {state.weekly_pnl_pct:.2%}')
-            return self._veto(intent, 'weekly_loss', abs(state.weekly_pnl_pct), L.max_weekly_loss)
+        # 2. drawdown ladder / daily halt
+        ladder = self.check_limits(state)
+        if ladder is not None:
+            observed = {'drawdown_stop': state.drawdown,
+                        'weekly_loss': abs(state.weekly_pnl_pct),
+                        'daily_loss': abs(state.daily_pnl_pct)}[ladder]
+            allowed = {'drawdown_stop': L.dd_stop_at, 'weekly_loss': L.max_weekly_loss,
+                       'daily_loss': L.max_daily_loss}[ladder]
+            return self._veto(intent, ladder, observed, allowed)
 
         # 3. feed staleness — never size into a stale book
         if intent.symbol in state.stale_feeds:
@@ -171,37 +241,35 @@ class RiskEngine:
                               float(state.consecutive_losses[intent.strategy]),
                               float(L.max_consecutive_losses))
 
-        # 6. exposure checks — these SHRINK rather than veto where it is safe to do so
+        # 6. exposure caps — SHRINK rather than veto
         mark = state.marks.get(intent.symbol)
         if mark is None or mark <= 0:
             return self._veto(intent, 'no_mark', 0.0, 0.0, note='no mark price')
 
-        target = intent.target.position
-        allowed = self._max_position(intent, state, mark)
+        allowed_qty = self._max_position(intent, state, mark)
         scale = Decimal('1')
-
-        if abs(target) > allowed:
-            # Reducing is always permitted, even past a limit — you may always de-risk.
-            current = state.positions.get(intent.symbol)
-            current_qty = current.quantity if current else Decimal('0')
-            if abs(target) < abs(current_qty):
-                pass                              # this intent reduces risk; let it through
-            else:
-                breaches.append(LimitBreach(limit='position_cap',
-                                            observed=float(abs(target) * mark / state.equity),
-                                            allowed=float(allowed * mark / state.equity),
-                                            hard=False))
-                scale = allowed / abs(target) if target else Decimal('0')
+        if abs(target) > allowed_qty:
+            breaches.append(LimitBreach(limit='position_cap',
+                                        observed=float(abs(target) * mark / state.equity),
+                                        allowed=float(allowed_qty * mark / state.equity),
+                                        hard=False))
+            scale = allowed_qty / abs(target)
 
         # 7. portfolio VaR
         if state.var_99_1d > L.max_var_99_1d:
             return self._veto(intent, 'var_99', state.var_99_1d, L.max_var_99_1d)
 
         adjusted = target * scale
+        dd = state.drawdown
         if dd >= L.dd_halve_at:
             adjusted *= Decimal('0.5')
             breaches.append(LimitBreach(limit='drawdown_halve', observed=dd,
                                         allowed=L.dd_halve_at, hard=False))
+
+        # Shrinking can never turn an increase into something *larger* than holding:
+        # if the capped target is smaller than what we already hold (same side), hold.
+        if have != 0 and (adjusted > 0) == (have > 0) and abs(adjusted) < abs(have):
+            adjusted = have
 
         return RiskDecision(intent_id=intent.intent_id, approved=True,
                             adjusted_position=adjusted, breaches=tuple(breaches),

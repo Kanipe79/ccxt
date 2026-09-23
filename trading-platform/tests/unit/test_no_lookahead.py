@@ -56,3 +56,22 @@ def test_donchian_excludes_current_bar():
     upper_before = ch.upper
     ch.push(20, 18)
     assert upper_before == 12 and ch.upper == 20
+
+
+def test_rolling_window_matches_exact_recomputation():
+    """The O(1) running-sum window must agree with a from-scratch computation,
+    including across the periodic resync boundary."""
+    import random
+    import statistics
+
+    from uxtrader.strategies.indicators import RollingWindow
+    rng = random.Random(3)
+    w = RollingWindow(360)
+    w.RESYNC = 500
+    xs = [rng.gauss(0, 0.02) for _ in range(2000)]
+    for i, x in enumerate(xs):
+        w.push(x)
+        if i >= 359 and i % 97 == 0:
+            window = xs[i - 359:i + 1]
+            assert w.mean() == pytest.approx(statistics.fmean(window), abs=1e-15)
+            assert w.std() == pytest.approx(statistics.stdev(window), rel=1e-9)

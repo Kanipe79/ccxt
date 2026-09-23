@@ -14,7 +14,7 @@ from typing import Any
 from .errors import ErrorClass, UXError
 from .plugin_registry import attach_all
 from .ratelimit import AdaptiveRateLimiter
-from .resilience import resilient
+from .resilience import ClientIdReconciler, resilient
 from .ws import FeedMonitor
 
 log = logging.getLogger(__name__)
@@ -45,7 +45,9 @@ class UXExchangeMixin:
         super().__init__(config or {})          # type: ignore[call-arg]
         self.limiter = AdaptiveRateLimiter(getattr(self, 'id', 'unknown'))
         self.monitor = FeedMonitor(on_resync=self._resync_feed)
-        self.reconciler: Any = None             # injected by the OMS
+        # Replaceable (the OMS may inject one backed by its own order log), but never
+        # absent: an AMBIGUOUS create with no reconciler cannot be retried safely.
+        self.reconciler: Any = ClientIdReconciler(self)
         self.plugins: dict[str, Any] = {}
         # We do our own limiting; upstream's fixed sleep would double-count.
         self.enableRateLimit = False            # noqa: N815 - ccxt's own casing
@@ -90,13 +92,15 @@ class UXExchangeMixin:
         return await self.create_order(symbol, type_, side, amount, price, p)  # type: ignore[attr-defined]
 
     # Cancels are risk-reducing: they bypass the rate-limiter reserve.
-    @resilient(mutating=True, weight=WEIGHTS['cancel_order'], risk_reducing=True)
+    @resilient(mutating=True, weight=WEIGHTS['cancel_order'], risk_reducing=True,
+               idempotent=True)
     async def ux_cancel_order(self, order_id: str, symbol: str, *,
                               client_order_id: str | None = None,
                               params: dict | None = None):
         return await self.cancel_order(order_id, symbol, params or {})  # type: ignore[attr-defined]
 
-    @resilient(mutating=True, weight=WEIGHTS['cancel_all_orders'], risk_reducing=True)
+    @resilient(mutating=True, weight=WEIGHTS['cancel_all_orders'], risk_reducing=True,
+               idempotent=True)
     async def ux_cancel_all(self, symbol: str | None = None, params: dict | None = None):
         return await self.cancel_all_orders(symbol, params or {})       # type: ignore[attr-defined]
 

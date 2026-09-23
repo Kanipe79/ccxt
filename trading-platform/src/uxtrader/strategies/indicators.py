@@ -12,12 +12,35 @@ from decimal import Decimal
 
 
 class RollingWindow:
+    """Fixed-length window with O(1) mean/std via running sums.
+
+    Recomputing a 360-element std on every bar made ``RealizedVol`` the single most
+    expensive thing in S4 — in the live engine as well as in backtests. Running sums
+    accumulate float error, so they are rebuilt exactly every ``RESYNC`` pushes; the
+    drift between rebuilds is ~1e-15 relative, far below anything a threshold sees.
+    """
+
+    RESYNC = 4096
+
     def __init__(self, length: int) -> None:
         self.length = length
         self.values: deque[float] = deque(maxlen=length)
+        self._sum = 0.0
+        self._sumsq = 0.0
+        self._pushes = 0
 
     def push(self, value: float) -> None:
+        if len(self.values) == self.length:
+            old = self.values[0]
+            self._sum -= old
+            self._sumsq -= old * old
         self.values.append(value)
+        self._sum += value
+        self._sumsq += value * value
+        self._pushes += 1
+        if self._pushes % self.RESYNC == 0:
+            self._sum = sum(self.values)
+            self._sumsq = sum(v * v for v in self.values)
 
     @property
     def ready(self) -> bool:
@@ -32,14 +55,16 @@ class RollingWindow:
         return min(self.values) if self.values else float('inf')
 
     def mean(self) -> float:
-        return sum(self.values) / len(self.values) if self.values else 0.0
+        n = len(self.values)
+        return self._sum / n if n else 0.0
 
     def std(self) -> float:
+        """Sample standard deviation (ddof=1)."""
         n = len(self.values)
         if n < 2:
             return 0.0
-        m = self.mean()
-        return (sum((v - m) ** 2 for v in self.values) / (n - 1)) ** 0.5
+        var = (self._sumsq - self._sum * self._sum / n) / (n - 1)
+        return var ** 0.5 if var > 0 else 0.0
 
 
 class EMA:

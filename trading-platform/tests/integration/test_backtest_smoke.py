@@ -90,3 +90,27 @@ async def test_risk_engine_shrinks_oversized_strategy_request():
 
     notional = first_fill.amount * first_fill.price
     assert notional <= Decimal('100000') * Decimal('0.20') * Decimal('1.01')
+
+
+@pytest.mark.asyncio
+async def test_strategy_sees_fills_before_the_next_bar():
+    """Regression: fills execute at bar t+1's open, before the strategy sees bar t+1.
+    The strategy's view must already include them — it once lagged a full bar."""
+    from uxtrader.strategy import StrategyBase
+
+    seen: list[Decimal] = []
+
+    class Probe(StrategyBase):
+        name = 'probe'
+        symbols = ('BTC/USDT:USDT',)
+
+        async def on_bar(self, bar):
+            seen.append(self.ctx.position(bar.symbol))
+            if len(seen) == 3:
+                return [self.target(bar.symbol, Decimal('0.1'), reason='probe entry')]
+            return []
+
+    bars = synthetic_bars(6)
+    await EventDrivenBacktester(starting_equity=Decimal('100000')).run(Probe, bars, start=START)
+    assert seen[2] == 0            # decided on bar 3's close
+    assert seen[3] == Decimal('0.1'), 'strategy saw a stale position after the fill'

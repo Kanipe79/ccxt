@@ -258,3 +258,152 @@ class DonchianRegime(StrategyBase):
         # much more reliable way to lose money than the gap itself.
         log.warning('s4_feed_stale feed=%s age=%.1f holding', feed, age)
         return []
+
+
+# ---------------------------------------------------------------------------------
+# Float port for the vectorized engine (lab/vector.py).
+#
+# This duplicates the decision logic above on purpose: the vectorized engine is for
+# parameter search, and it is only trustworthy because the cross-validation test
+# proves it matches the event-driven class within 2%. If you change the class above,
+# change this too — the test will fail until you do, which is the point.
+# ---------------------------------------------------------------------------------
+
+def vector_decider(bars, params: dict | None = None, *, risk_budget: float = 1.0,
+                   funding_apr=None):
+    """Return ``decide(t, equity, position) -> target | None`` for ``VectorBacktester``.
+
+    ``bars`` is a DataFrame with open/high/low/close columns. ``params`` may override
+    any of the class constants (CHANNEL, EXIT_CHANNEL, ATR_PERIOD, STOP_ATR_MULT,
+    RISK_FRACTION, ADX_MIN, RANGE_EXPANSION, ...) — this is what Optuna varies.
+    """
+    import numpy as np
+
+    P = {k: getattr(DonchianRegime, k) for k in (
+        'CHANNEL', 'EXIT_CHANNEL', 'ATR_PERIOD', 'STOP_ATR_MULT', 'RISK_FRACTION',
+        'ADX_MIN', 'VOL_RATIO_BAND', 'RANGE_EXPANSION', 'MAX_FUNDING_APR')}
+    P.update(params or {})
+
+    h = bars['high'].to_numpy(float)
+    lo = bars['low'].to_numpy(float)
+    c = bars['close'].to_numpy(float)
+    n = len(c)
+    apr = np.zeros(n) if funding_apr is None else np.asarray(funding_apr, float)
+
+    # Indicators computed exactly as on_bar computes them: channels read BEFORE the
+    # current bar is pushed, everything else after.
+    ch, ex_ch = Donchian(int(P['CHANNEL'])), Donchian(int(P['EXIT_CHANNEL']))
+    atr_i, adx_i, ema_i = ATR(int(P['ATR_PERIOD'])), ADX(14), EMA(200 * 6)
+    vf_i = RealizedVol(10 * 6, BARS_PER_YEAR_4H)
+    vs_i = RealizedVol(60 * 6, BARS_PER_YEAR_4H)
+    ready = np.zeros(n, bool)
+    up = np.full(n, np.inf)
+    dn = np.full(n, -np.inf)
+    ex_up = np.full(n, np.nan)
+    ex_dn = np.full(n, np.nan)
+    atr = np.full(n, np.nan)
+    adx = np.full(n, np.nan)
+    ema = np.full(n, np.nan)
+    vf = np.full(n, np.nan)
+    vs = np.full(n, np.nan)
+    for t in range(n):
+        if ch.ready:
+            ready[t], up[t], dn[t] = True, ch.upper, ch.lower
+        if ex_ch.ready:
+            ex_up[t], ex_dn[t] = ex_ch.upper, ex_ch.lower
+        a = atr_i.push(h[t], lo[t], c[t])
+        d = adx_i.push(h[t], lo[t], c[t])
+        e = ema_i.push(c[t])
+        f = vf_i.push(c[t])
+        s = vs_i.push(c[t])
+        atr[t] = np.nan if a is None else a
+        adx[t] = np.nan if d is None else d
+        ema[t] = np.nan if e is None else e
+        vf[t] = np.nan if f is None else f
+        vs[t] = np.nan if s is None else s
+        ch.push(h[t], lo[t])
+        ex_ch.push(h[t], lo[t])
+
+    k, rf = P['STOP_ATR_MULT'], P['RISK_FRACTION']
+    st = {'entry': None, 'stop': None, 'peak': None, 'adds': 0, 'partial': False}
+
+    def size(equity: float, stop_distance: float, risk_fraction: float,
+             vol_scalar: float = 1.0) -> float:
+        if stop_distance <= 0:
+            return 0.0
+        sleeve = equity * risk_budget
+        return sleeve * min(risk_fraction, 0.015) / stop_distance * max(0.25, min(vol_scalar, 2.0))
+
+    def clear() -> None:
+        st.update(entry=None, stop=None, peak=None, adds=0, partial=False)
+
+    def decide(t: int, equity: float, pos: float):
+        if not ready[t] or np.isnan(atr[t]):
+            return None
+        close, a = c[t], atr[t]
+        if pos != 0:
+            direction = 1 if pos > 0 else -1
+            entry = st['entry'] if st['entry'] is not None else close
+            stop = st['stop']
+            r_unit = k * a
+            if stop is None or r_unit <= 0:
+                return None
+            r = direction * (close - entry) / r_unit
+            if (direction == 1 and close <= stop) or (direction == -1 and close >= stop):
+                clear()
+                return 0.0
+            if direction == 1 and not np.isnan(ex_dn[t]) and close < ex_dn[t]:
+                clear()
+                return 0.0
+            if direction == -1 and not np.isnan(ex_up[t]) and close > ex_up[t]:
+                clear()
+                return 0.0
+            peak = st['peak'] if st['peak'] is not None else entry
+            peak = max(peak, close) if direction == 1 else min(peak, close)
+            st['peak'] = peak
+            if r >= 1.0:
+                trail = peak - direction * k * a
+                cand = max(trail, entry) if direction == 1 else min(trail, entry)
+                if (direction == 1 and cand > stop) or (direction == -1 and cand < stop):
+                    st['stop'] = cand
+            if r >= 2.0 and not st['partial']:
+                st['partial'] = True
+                return pos / 2
+            for level, m in ((1.5, 1), (3.0, 2)):
+                if r >= level and st['adds'] == m - 1:
+                    st['adds'] = m
+                    add = size(equity, r_unit, rf * 0.5)
+                    st['stop'] = entry
+                    return pos + add * direction
+            return None
+
+        if np.isnan(ema[t]) or np.isnan(adx[t]) or np.isnan(vf[t]) or np.isnan(vs[t]):
+            return None
+        if close > up[t]:
+            direction = 1
+        elif close < dn[t]:
+            direction = -1
+        else:
+            return None
+        if (direction == 1 and close <= ema[t]) or (direction == -1 and close >= ema[t]):
+            return None
+        ratio = vf[t] / vs[t] if vs[t] > 0 else 0.0
+        lo_b, hi_b = P['VOL_RATIO_BAND']
+        if not (adx[t] > P['ADX_MIN'] or lo_b <= ratio <= hi_b):
+            return None
+        if (h[t] - lo[t]) <= P['RANGE_EXPANSION'] * a:
+            return None
+        if direction == 1 and apr[t] > P['MAX_FUNDING_APR']:
+            return None
+        if direction == -1 and apr[t] < -P['MAX_FUNDING_APR']:
+            return None
+        stop_distance = k * a
+        vol_scalar = max(0.25, min(0.15 / vs[t], 2.0)) if vs[t] > 0 else 1.0
+        qty = size(equity, stop_distance, rf, vol_scalar)
+        if qty <= 0:
+            return None
+        st.update(entry=close, stop=close - direction * stop_distance, peak=close,
+                  adds=0, partial=False)
+        return qty * direction
+
+    return decide

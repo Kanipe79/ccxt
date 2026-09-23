@@ -54,6 +54,60 @@ class CircuitBreaker:
             log.error('circuit_breaker_open failures=%d', self._failures)
 
 
+class ClientIdReconciler:
+    """Default reconciler: look the order up by its deterministic client order id.
+
+    Checks open orders first (cheap, and where a just-placed order usually is), then
+    recent order history where the venue supports it (the order may have filled
+    instantly). If neither lookup can be performed, it *raises* rather than returning
+    False — "I could not check" must never be read as "it does not exist", because
+    that reading is exactly how a duplicate order gets sent.
+    """
+
+    def __init__(self, exchange: Any, history_limit: int = 50) -> None:
+        self.exchange = exchange
+        self.history_limit = history_limit
+
+    async def order_exists(self, venue: str, symbol: str, client_order_id: str) -> bool:
+        ex = self.exchange
+        checked = False
+        for method in ('fetch_open_orders', 'fetch_orders', 'fetch_closed_orders'):
+            has = (getattr(ex, 'has', {}) or {}).get(_camel(method))
+            if has is False or not hasattr(ex, method):
+                continue
+            try:
+                kwargs = {} if method == 'fetch_open_orders' else {'limit': self.history_limit}
+                orders = await getattr(ex, method)(symbol, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - try the next lookup
+                log.warning('reconcile_lookup_failed venue=%s method=%s err=%s',
+                            venue, method, exc)
+                continue
+            checked = True
+            if any(_client_id(o) == client_order_id for o in orders):
+                return True
+        if not checked:
+            raise UXError('reconciliation impossible: no order lookup succeeded',
+                          ErrorClass.AMBIGUOUS, venue=venue,
+                          client_order_id=client_order_id)
+        return False
+
+
+def _client_id(order: dict[str, Any]) -> str | None:
+    cid = order.get('clientOrderId')
+    if cid:
+        return str(cid)
+    info = order.get('info') or {}
+    for key in ('clientOrderId', 'origClientOrderId', 'clOrdId', 'orderLinkId', 'cloid'):
+        if info.get(key):
+            return str(info[key])
+    return None
+
+
+def _camel(snake: str) -> str:
+    head, *rest = snake.split('_')
+    return head + ''.join(w.title() for w in rest)
+
+
 _BREAKERS: dict[str, CircuitBreaker] = {}
 
 
@@ -62,12 +116,17 @@ def breaker_for(venue: str) -> CircuitBreaker:
 
 
 def resilient(*, mutating: bool = False, weight: int = 1,
-              risk_reducing: bool = False) -> Callable[..., Any]:
+              risk_reducing: bool = False, idempotent: bool = False) -> Callable[..., Any]:
     """Wrap an exchange coroutine with rate limiting, retry policy and reconciliation.
 
-    ``mutating=True`` means the call changes state at the venue (create/cancel/edit).
-    Those calls are the ones where a timeout becomes AMBIGUOUS, and where we must
-    reconcile before a retry rather than retrying blind.
+    ``mutating=True`` means the call changes state at the venue. For a
+    non-idempotent mutation (create/edit) a no-response failure becomes AMBIGUOUS and
+    must be reconciled before any retry.
+
+    ``idempotent=True`` (cancels) means repeating the call cannot do harm — a second
+    cancel of an already-cancelled order just returns OrderNotFound — so ambiguity is
+    resolved by simply retrying, with no reconciliation round-trip. That matters
+    during a cascade, when cancels must get through quickly.
     """
 
     def decorator(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
@@ -93,10 +152,16 @@ def resilient(*, mutating: bool = False, weight: int = 1,
                 except asyncio.CancelledError:
                     raise
                 except BaseException as exc:  # noqa: BLE001 - classified immediately
-                    err = classify(exc, venue=venue, was_sent=mutating,
+                    err = classify(exc, venue=venue,
+                                   was_sent=mutating and not idempotent,
                                    client_order_id=kwargs.get('client_order_id'))
                     last = err
-                    breaker.record_failure()
+                    # Only venue-health failures count toward the breaker. A rejected
+                    # order is the venue working fine, and a 429 means *we* are too
+                    # fast — the limiter owns that, and opening the circuit on it would
+                    # also block the cancels the limiter's reserve exists to protect.
+                    if err.klass in (ErrorClass.TRANSIENT, ErrorClass.AMBIGUOUS):
+                        breaker.record_failure()
 
                     if err.klass is ErrorClass.RATE_LIMITED and limiter is not None:
                         limiter.penalise(err.policy.delay_for(attempt))

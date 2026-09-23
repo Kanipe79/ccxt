@@ -101,9 +101,19 @@ class AdaptiveRateLimiter:
                 return
 
     def penalise(self, seconds: float) -> None:
-        """Called on a 429. Hard stop for `seconds`, and drain the bucket."""
+        """Called on a 429. Hard stop for `seconds` — for EVERY call, cancels included,
+        because venues escalate repeated 429s into IP bans (Binance: 418) that would
+        block cancels for minutes.
+
+        The bucket is drained to the risk reserve, not to zero: once the backoff ends,
+        risk-reducing calls must be able to go immediately. Draining to zero would make
+        them queue behind a full refill (~18 s on Binance futures) at exactly the
+        moment they matter.
+        """
         self._backoff_until = max(self._backoff_until, time.monotonic() + seconds)
-        self._bucket.tokens = 0.0
+        self._bucket.refill()
+        self._bucket.tokens = min(self._bucket.tokens,
+                                  self._bucket.capacity * RISK_RESERVE)
 
     @property
     def utilisation(self) -> float:
